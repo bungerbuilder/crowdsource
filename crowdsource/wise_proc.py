@@ -480,7 +480,7 @@ if __name__ == "__main__":
         hdulist = fits.open(args.modelfn, mode='append')
         compkw = {'compression_type': 'GZIP_1',
                   'quantize_method': 2, 'quantize_level': -0.5,
-                  'tile_size': model.shape}
+                  'tile_shape': model.shape}
         hdr['EXTNAME'] = 'model'
         hdulist.append(fits.CompImageHDU(model, hdr, **compkw))
         hdr['EXTNAME'] = 'sky'
@@ -493,12 +493,12 @@ if __name__ == "__main__":
         hdulist = fits.open(args.infoimfn, mode='append')
         compkw = {'compression_type': 'GZIP_1',
                   'quantize_method': 2,
-                  'tile_size': psffluxivar.shape}
+                  'tile_shape': psffluxivar.shape}
         hdr['EXTNAME'] = 'psffluxivar'
         hdulist.append(fits.CompImageHDU(psffluxivar, hdr, **compkw))
         hdr['EXTNAME'] = 'infoflags'
         compkw = {'compression_type': 'GZIP_1',
-                  'tile_size': flags_infoim.shape}
+                  'tile_shape': flags_infoim.shape}
         # must recast flags_infoim as a u1; unsigned isn't supported
         # in tables, but signed int8 isn't supported in CompImageHDU.
         # ugh.
