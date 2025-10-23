@@ -27,14 +27,11 @@ extrabits = {'crowdsat': 2**25,
 nodeblend_bits = extrabits['hyperleda']
 sharp_bits = (extrabits['w1brightoffedge'] | extrabits['w2brightoffedge'])
 
-
 def wise_filename(basedir, coadd_id, band, _type, uncompressed=False,
                   drop_first_dir=False, epoch=-1):
     # type should be one of:
     # 'img-u', 'img-m', 'invvar-u', 'invvar-m', 'std-u', 'std-m'
     # 'n-u', 'n-m', 'frames', 'msk'
-
-    # -msk is special because the info for both W1/W2 is in same file
 
     fname = 'unwise-' + coadd_id
     if _type != 'msk':
@@ -51,10 +48,14 @@ def wise_filename(basedir, coadd_id, band, _type, uncompressed=False,
     fname = os.path.join(*path)
 
     if not uncompressed or _type == 'msk':
-        if (_type != 'img-u') and (_type != 'img-m') and (_type != 'frames'):
-            fname += '.gz'
-
+        if (_type not in ['img-u', 'img-m', 'frames']):
+            # Prefer .gz if it exists
+            gzname = fname + '.gz'
+            if os.path.exists(gzname):
+                return gzname
+            # Otherwise fall back to plain .fits
     return fname
+
 
 
 def read_blist(brightstars, raim, decim, hdr, maxsep):
@@ -335,174 +336,288 @@ if __name__ == "__main__":
     except Exception:
         print("Couldn't retrieve hostname!")
 
-    parser = argparse.ArgumentParser(description='Run crowdsource on unWISE coadd image')
+    parser = argparse.ArgumentParser(description='Run crowdsource on WISE coadd image(s)')
     parser.add_argument('coadd_id', type=str, nargs=1)
-    parser.add_argument('band', type=int, nargs=1)
-    parser.add_argument('outfn', type=str, nargs=1)
-
-    parser.add_argument('basedir', type=str, nargs='?', default='/global/projecta/projectdirs/cosmo/work/wise/outputs/merge/neo4/fulldepth')
+    parser.add_argument('bands', type=int, nargs='+', help='Bands to process, e.g. 1 2 or 1 2 3 4 ...')
+    parser.add_argument('--bandweights', type=float, nargs='+', default=None)
+    parser.add_argument('outdir', type=str, nargs=1, help='Base output directory (will create cat/, mod/, iminfo/, log/ subdirs)')
+    parser.add_argument('--basedir', type=str, nargs='?', default='/global/cfs/cdirs/cosmo/work/wise/outputs/merge/neo8/fulldepth', help='Input directory to images')
+    parser.add_argument('--outfn', '-o', default=None, type=str, help='Catalog file path (default: auto-generated in outdir/cat/)')
+    parser.add_argument('--modelfn', '-m', default=None, type=str, help='Model file path (default: auto-generated in outdir/mod/)')
+    parser.add_argument('--infoimfn', '-i', default=None, type=str, help='Info image file path (default: auto-generated in outdir/iminfo/)')
     parser.add_argument('--refit-psf', '-r', default=False, action='store_true')
     parser.add_argument('--verbose', '-v', default=False, action='store_true')
     parser.add_argument('--uncompressed', '-u', default=False, action='store_true')
-    parser.add_argument('--brightcat', '-b',
-                        default=os.environ.get('TMASS_BRIGHT', ''), type=str)
-    parser.add_argument('--modelfn', '-m', default='', type=str,
-                        help='file name for model image, if desired')
-    parser.add_argument('--infoimfn', '-i', default='', type=str,
-                        help='file name for info image, if desired')
+    parser.add_argument('--brightcat', '-b', default=os.environ.get('TMASS_BRIGHT', ''), type=str)
     parser.add_argument('--masknebulosity', '-n', action='store_true')
     parser.add_argument('--forcecat', type=str, default='')
     parser.add_argument('--startsky', type=str, default='')
     parser.add_argument('--startpsf', type=str, default='')
     parser.add_argument('--noskyfit', default=False, action='store_true')
-    parser.add_argument('--threshold', default=5, type=float,
-                        help='find sources down to threshold*sigma')
-    parser.add_argument('--epoch', type=int, default=-1,
-                        help='epoch number of time-resolved WISE coadd')
+    parser.add_argument('--threshold', default=5, type=float)
+    parser.add_argument('--epoch', type=int, default=-1)
     parser.add_argument('--release', type=str, default='')
 
     args = parser.parse_args()
 
     coadd_id = args.coadd_id[0]
-    band = args.band[0]
     basedir = args.basedir
+    outdir = args.outdir[0]
+    
+    for subdir in ["", "cat", "mod", "iminfo", "log"]: os.makedirs(os.path.join(outdir, subdir), exist_ok=True)
+    bands_str = ''.join(str(b) for b in args.bands)  # e.g. '2' or '12' or '1234'
+    if args.bandweights == None: bw_str = ''
+    else: bw_str = '.'+''.join(str(b) for b in args.bandweights)
+    
+    if args.outfn is None: outfn = f'{coadd_id}.{bands_str}{bw_str}.cat.fits'
+    else: outfn = args.outfn
+    if args.modelfn is None: modelfn = f'{coadd_id}.{bands_str}{bw_str}.mod.fits'
+    else: modelfn = args.modelfn
+    if args.infoimfn is None: infoimfn = f'{coadd_id}.{bands_str}{bw_str}.info.fits'
+    else: infoimfn = args.infoimfn
+        
+    outfn = os.path.join(outdir, 'cat', outfn)
+    modelfn = os.path.join(outdir,'mod', modelfn)
+    infoimfn = os.path.join(outdir, 'iminfo', infoimfn)
 
-    im, sqivar, flag, hdr = read_wise(coadd_id, band, basedir,
-                                      uncompressed=args.uncompressed,
-                                      epoch=args.epoch)
-    if len(args.startsky) > 0:
-        startsky = fits.getdata(args.startsky, 'SKY')
-    else:
-        startsky = numpy.nan
-    flag_orig = fits.getdata(wise_filename(basedir, coadd_id, band, 'msk',
-                                           uncompressed=args.uncompressed,
-                                           epoch=args.epoch))
+    ims, sqivars, psfs, flags, hdrs, blists = [], [], [], [], [], []
+    for band in args.bands:
+        im, sqivar, flag, hdr = read_wise(coadd_id, band, basedir,
+                                          uncompressed=args.uncompressed,
+                                          epoch=args.epoch)
+    
+        if len(args.startsky) > 0:
+            startsky = fits.getdata(args.startsky, 'SKY')
+        else:
+            startsky = numpy.nan
+    
+        flag_orig = fits.getdata(wise_filename(basedir, coadd_id, band, 'msk',
+                                               uncompressed=args.uncompressed,
+                                               epoch=args.epoch))
+    
+        if args.masknebulosity:
+            import nebulosity_mask
+            nebfn = os.path.join(os.environ['WISE_DIR'], 'dat', 'nebnet',
+                                 'weights1', '1st_try')
+            nebmod = nebulosity_mask.load_model(nebfn)
+            nebmask = nebulosity_mask.gen_mask_wise(nebmod, im) == 2
+            if numpy.any(nebmask):
+                # mark those pixels as bad in the flag map
+                flag |= nebmask * extrabits['nebulosity']
+                flag |= nebmask * crowdsource_base.sharp_maskbit
+                print('Masking nebulosity, %5.2f' % ( numpy.sum(nebmask)/1./numpy.sum(numpy.isfinite(nebmask))))
+    
+        psf = wise_psf_grid(band, coadd_id, basedir, epoch=args.epoch)
 
-    if args.masknebulosity:
-        import nebulosity_mask
-        nebfn = os.path.join(os.environ['WISE_DIR'], 'dat', 'nebnet',
-                             'weights1', '1st_try')
-        nebmod = nebulosity_mask.load_model(nebfn)
-        nebmask = nebulosity_mask.gen_mask_wise(nebmod, im) == 2
-        if numpy.any(nebmask):
-            flag |= nebmask * extrabits['nebulosity']
-            flag |= nebmask * crowdsource_base.sharp_maskbit
-            print('Masking nebulosity, %5.2f' % (
-                numpy.sum(nebmask)/1./numpy.sum(numpy.isfinite(nebmask))))
+        if len(args.startpsf) > 0:
+            startpsf = fits.getdata(args.startpsf, 'PSF').astype('f4')
+            # there can be some endianness issues; astype('f4') converts to native
+            modpsf = psf(1024, 1024, stampsz=psf.stamp.shape[-1])
+            resid = startpsf - modpsf
+            # need not sum to zero.
+            newstamps = psf.stamp / psf.normstamp[:, :, None, None]
+            newstamps += resid
+            psf = psfmod.GridInterpPSF(newstamps, psf.x, psf.y)
+            from functools import partial
+            psf.fitfun = partial(psfmod.wise_psf_fit,
+                                 psfstamp=(newstamps, psf.x, psf.y), grid=True)
+    
+        if len(args.brightcat) > 0:
+            brightstars = fits.getdata(args.brightcat)
+            blist = brightlist(brightstars, coadd_id, band, basedir,
+                               uncompressed=args.uncompressed, epoch=args.epoch)
+        else:
+            print(f'No bright star catalog in band{band}, not marking bright stars.')
+            blist = None
+    
+        ims.append(im); sqivars.append(sqivar); psfs.append(psf); flags.append(flag); hdrs.append(hdr); blists.append(blist)
 
-    psf = wise_psf_grid(band, coadd_id, basedir, epoch=args.epoch)
-    if len(args.startpsf) > 0:
-        startpsf = fits.getdata(args.startpsf, 'PSF').astype('f4')
-        # there can be some endianness issues; astype('f4') converts to native
-        modpsf = psf(1024, 1024, stampsz=psf.stamp.shape[-1])
-        resid = startpsf-modpsf
-        # need not sum to zero.
-        newstamps = psf.stamp / psf.normstamp[:, :, None, None]
-        newstamps += resid
-        psf = psfmod.GridInterpPSF(newstamps, psf.x, psf.y)
-        from functools import partial
-        psf.fitfun = partial(psfmod.wise_psf_fit,
-                             psfstamp=(newstamps, psf.x, psf.y), grid=True)
-
-    if len(args.brightcat) > 0:
-        brightstars = fits.getdata(args.brightcat)
-        blist = brightlist(brightstars, coadd_id, band, basedir,
-                           uncompressed=args.uncompressed, epoch=args.epoch)
-    else:
-        print('No bright star catalog, not marking bright stars.')
-        blist = None
+    # print("Input image shapes:", [im.shape for im in ims])
+    # print("Weight shapes:", [sq.shape for sq in sqivars])
+    # print("Flag shapes:", [fl.shape for fl in flags])
+    # print("PSF shapes:", [psf.stamp.shape for psf in numpy.array(psfs)])
 
     if args.verbose:
+        logfn = os.path.join(outdir, 'log', f'{coadd_id}.{bands_str}.log')
+        sys.stdout = open(logfn, "w")
+        sys.stderr = sys.stdout
         t0 = time.time()
-        print('Starting %s, band %d, at %s' % (coadd_id, band, time.ctime()))
+        print('Starting %s, bands %s, at %s' % (coadd_id, bands_str, time.ctime()))
+        print('Band weights:', args.bandweights)
         sys.stdout.flush()
 
-    if len(args.forcecat) == 0:
-        res = crowdsource_base.fit_im(
-            im, psf, weight=sqivar, dq=flag, refit_psf=args.refit_psf,
-            verbose=args.verbose, ntilex=4, ntiley=4, derivcentroids=True,
-            maxstars=30000*16, fewstars=50*16, blist=blist,
-            threshold=args.threshold, psfvalsharpcutfac=0.5,
-            psfsharpsat=0.8)
+    if len(args.bands) == 1:
+        im, sqivar, psf, flag, blist = ims[0], sqivars[0], psfs[0], flags[0], blists[0]
+        if len(args.forcecat) == 0:
+            res = crowdsource_base.fit_im(
+                im, psf, weight=sqivar, dq=flag,
+                refit_psf=args.refit_psf, verbose=args.verbose,
+                ntilex=4, ntiley=4, derivcentroids=True,
+                maxstars=30000*16, fewstars=50*16,
+                blist=blist, threshold=args.threshold,
+                psfvalsharpcutfac=0.5, psfsharpsat=0.8)
+        else:
+            forcecat = fits.getdata(args.forcecat, 1)
+            x, y = forcecat['x'], forcecat['y']
+            res = crowdsource_base.fit_im_force(
+                im, x, y, psf, weight=sqivar, dq=flag,
+                refit_psf=args.refit_psf, blist=blist,
+                refit_sky=(not args.noskyfit), startsky=startsky,
+                psfderiv=False, psfvalsharpcutfac=0.5, psfsharpsat=0.8)
     else:
-        forcecat = fits.getdata(args.forcecat, 1)
-        x, y = forcecat['x'], forcecat['y']
-        res = crowdsource_base.fit_im_force(
-            im, x, y, psf, weight=sqivar, dq=flag, refit_psf=args.refit_psf,
-            blist=blist, refit_sky=(not args.noskyfit),
-            startsky=startsky, psfderiv=False, psfvalsharpcutfac=0.5,
-            psfsharpsat=0.8)
+        flag_combined = numpy.bitwise_or.reduce(numpy.stack(flags, axis=0))
+        res = crowdsource_base.fit_im_multiband(
+            ims, psfs, weights=sqivars, dq=flag_combined, band_weights=args.bandweights,
+            refit_psf=args.refit_psf, verbose=args.verbose,
+            ntilex=4, ntiley=4, derivcentroids=True,
+            maxstars=30000*16, fewstars=50*16,
+            threshold=args.threshold,
+            psfvalsharpcutfac=0.5, psfsharpsat=0.8)
+
+        
     cat, model, sky, psf = res
-    print('Finishing %s, band %d; %d sec elapsed.' %
-          (coadd_id, band, time.time()-t0))
+    print('Finishing %s, band %s; %d sec elapsed.' %(coadd_id, args.bands, time.time()-t0))
 
-    outfn = args.outfn[0]
+    x = cat['x']; y = cat['y']
 
-    x = cat['x']
-    y = cat['y']
-
+    if len(args.bands) == 1:
+        # --- Single-band case ---
+        hdr = hdrs[0]  # just the single band header
+        hdr['BAND'] = args.bands[0]
+    
+        band_val = args.bands[0]
+        id_prefix = f"{coadd_id}w{band_val}"
+    
+    else:
+        # --- Multiband case ---
+        hdr = hdrs[0].copy()
+        hdr['BANDS'] = ','.join(str(b) for b in args.bands)
+    
+        id_prefix = f"{coadd_id}w{''.join(str(b) for b in args.bands)}"
+    
+    # ---- Now compute RA/Dec using hdr ----
     wcs0 = wcs.WCS(hdr)
     ra, dec = wcs0.all_pix2world(y, x, 0)
-    coadd_ids = numpy.zeros(len(ra), dtype='a8')
-    bands = numpy.zeros(len(ra), dtype='i4')
-    ids = numpy.zeros(len(ra), dtype='U20')
-    coadd_ids[:] = coadd_id
-    bands[:] = band
-    if len(args.release) == 0:
-        ids = ['%sw%1do%07d' % (coadd_id, band, num) for num in range(len(ra))]
-    else:
-        ids = ['%sw%1do%07dr%s' % (coadd_id, band, num, args.release)
-               for num in range(len(ra))]
+    coadd_ids = numpy.full(len(ra), coadd_id, dtype='a8')
+    
+    # ---- Build bands_col ----
+    if len(args.bands) == 1: bands_col = numpy.full(len(ra), band_val, dtype='i4')
+    else: bands_col = numpy.full(len(ra), -1, dtype='i4')  # -1 = joint fit
 
-    nmfn = wise_filename(basedir, coadd_id, band, 'n-m',
-                         uncompressed=args.uncompressed, epoch=args.epoch)
-    nmim = fits.getdata(nmfn)
-    nms = crowdsource_base.extract_im(cat['x'], cat['y'], nmim)
-    flags_unwise = crowdsource_base.extract_im(
-        cat['x'], cat['y'], collapse_unwise_bitmask(flag_orig, band))
-    flags_infoim = collapse_extraflags(flag, band)
-    flags_info = crowdsource_base.extract_im(cat['x'], cat['y'], flags_infoim)
+    if len(args.release) == 0: ids = [f"{id_prefix}o{num:07d}" for num in range(len(ra))]
+    else: ids = [f"{id_prefix}o{num:07d}r{args.release}" for num in range(len(ra))]
+
+
+    nm_all, flags_unwise_all, flags_info_all = [], [], []
+    for band in args.bands:
+        # nm per band
+        nmfn = wise_filename(basedir, coadd_id, band, 'n-m', uncompressed=args.uncompressed, epoch=args.epoch)
+        nmim = fits.getdata(nmfn)
+        nm_all.append(crowdsource_base.extract_im(cat['x'], cat['y'], nmim))
+    
+        # unwise flags per band
+        fu = crowdsource_base.extract_im(cat['x'], cat['y'], collapse_unwise_bitmask(flag_orig, band))
+        flags_unwise_all.append(fu)
+    
+        # info flags per band
+        fi = crowdsource_base.extract_im(cat['x'], cat['y'], collapse_extraflags(flag, band))
+        flags_info_all.append(fi)
+    
+    # Stack into (nbands, nsource) arrays  
+    nm_all = numpy.array(nm_all)                  # shape (nbands, nsrc)
+    flags_unwise_all = numpy.array(flags_unwise_all)
+    flags_info_all   = numpy.array(flags_info_all)
+    
     # cast to i2; astropy.io.fits seems to fail for bools?
     primary = unwise_primary.is_primary(coadd_id, ra, dec).astype('i2')
-
+    
     import numpy.lib.recfunctions as rfn
     cat = rfn.drop_fields(cat, ['flags'])
+    # Append the common columns
     cat = rfn.append_fields(
-        cat, ['ra', 'dec', 'coadd_id', 'band', 'unwise_detid', 'nm',
-              'primary', 'flags_unwise', 'flags_info'],
-        [ra, dec, coadd_ids, bands, ids, nms, primary, flags_unwise,
-         flags_info])
+        cat,
+        ['ra', 'dec', 'coadd_id', 'band', 'unwise_detid', 'primary'],
+        [ra, dec, coadd_ids, bands_col, ids, primary],
+        usemask=False
+    )
+    # append per-band info as separate columns
+    for ib, band in enumerate(args.bands):
+        cat = rfn.append_fields(cat, [f'nm_b{band}'], [nm_all[:, ib]], usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_unwise_b{band}'], [flags_unwise_all[:, ib]], usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_info_b{band}'], [flags_info_all[:, ib]], usemask=False)
+
 
     hdr['EXTNAME'] = 'PRIMARY'
     fits.writeto(outfn, None, hdr, overwrite=True)
     fits.append(outfn, cat)
-    if len(args.modelfn) > 0:
-        hdulist = fits.open(args.modelfn, mode='append')
+    
+    if modelfn is not None:
+        hdulist = fits.open(modelfn, mode='append')
+        if len(model)==2: mshape= model[0].shape  #multiband
+        else: mshape = model.shape  #single band
         compkw = {'compression_type': 'GZIP_1',
-                  'quantize_method': 2, 'quantize_level': -0.5,
-                  'tile_size': model.shape}
+                      'quantize_method': 2, 'quantize_level': -0.5,
+                      'tile_shape': mshape}
         hdr['EXTNAME'] = 'model'
-        hdulist.append(fits.CompImageHDU(model, hdr, **compkw))
+        hdulist.append(fits.CompImageHDU(numpy.stack(model, axis=0), hdr, **compkw))
         hdr['EXTNAME'] = 'sky'
-        hdulist.append(fits.CompImageHDU(sky, hdr, **compkw))
+        hdulist.append(fits.CompImageHDU(numpy.stack(sky, axis=0), hdr, **compkw))
         hdulist.close(closed=True)
 
-    if len(args.infoimfn) > 0:
-        psffluxivar = ivarmap(sqivar, psf(1024, 1024, stampsz=59)).astype('f4')
-        psfstamp = psf(1024, 1024, stampsz=325)
-        hdulist = fits.open(args.infoimfn, mode='append')
-        compkw = {'compression_type': 'GZIP_1',
-                  'quantize_method': 2,
-                  'tile_size': psffluxivar.shape}
-        hdr['EXTNAME'] = 'psffluxivar'
-        hdulist.append(fits.CompImageHDU(psffluxivar, hdr, **compkw))
-        hdr['EXTNAME'] = 'infoflags'
-        compkw = {'compression_type': 'GZIP_1',
-                  'tile_size': flags_infoim.shape}
-        # must recast flags_infoim as a u1; unsigned isn't supported
-        # in tables, but signed int8 isn't supported in CompImageHDU.
-        # ugh.
-        hdulist.append(fits.CompImageHDU(flags_infoim.astype('u1'),
-                                         hdr, **compkw))
-        hdulist.append(fits.ImageHDU(psfstamp, None, name='psf'))
+    if infoimfn is not None:
+        hdulist = fits.open(infoimfn, mode='append')
+    
+        if len(args.bands) == 1:
+            # --- single-band (old behavior) ---
+            band = args.bands[0]
+            psffluxivar = ivarmap(sqivar, psf(1024, 1024, stampsz=59)).astype('f4')
+            psfstamp    = psf(1024, 1024, stampsz=325)
+            flags_infoim = collapse_extraflags(flag, band)
+    
+            compkw = {'compression_type': 'GZIP_1',
+                      'quantize_method': 2,
+                      'tile_shape': psffluxivar.shape}
+            hdr['EXTNAME'] = 'psffluxivar'
+            hdulist.append(fits.CompImageHDU(psffluxivar, hdr, **compkw))
+    
+            compkw = {'compression_type': 'GZIP_1',
+                      'tile_shape': flags_infoim.shape}
+            # must recast flags_infoim as a u1; unsigned isn't supported
+            # in tables, but signed int8 isn't supported in CompImageHDU.
+            # ugh.
+            hdr['EXTNAME'] = 'infoflags'
+            hdulist.append(fits.CompImageHDU(flags_infoim.astype('u1'), hdr, **compkw))
+    
+            hdr['EXTNAME'] = 'psf'
+            hdulist.append(fits.ImageHDU(psfstamp, None))
+    
+        else:
+            # --- multiband (stacked) ---
+            psffluxivar_all, flags_infoim_all, psfstamp_all = [], [], []
+            for ib, band in enumerate(args.bands):
+                psffluxivar_all.append(ivarmap(sqivars[ib], psf[ib](1024,1024,stampsz=59)).astype('f4'))
+                flags_infoim_all.append(collapse_extraflags(flags[ib], band))
+                psfstamp_all.append(psf[ib](1024,1024,stampsz=325))
+    
+            psffluxivar_all = numpy.array(psffluxivar_all)   # shape (nband, ny, nx)
+            flags_infoim_all = numpy.array(flags_infoim_all) # shape (nband, ny, nx)
+            psfstamp_all     = numpy.array(psfstamp_all)     # shape (nband, ny_psf, nx_psf)
+    
+            compkw = {'compression_type': 'GZIP_1',
+                      'quantize_method': 2,
+                      'tile_shape': psffluxivar_all.shape[-2:]}
+            hdr['EXTNAME'] = 'psffluxivar'
+            hdulist.append(fits.CompImageHDU(psffluxivar_all.astype('f4'), hdr, **compkw))
+    
+            compkw = {'compression_type': 'GZIP_1',
+                      'tile_shape': flags_infoim_all.shape[-2:]}
+            hdr['EXTNAME'] = 'infoflags'
+            hdulist.append(fits.CompImageHDU(flags_infoim_all.astype('u1'), hdr, **compkw))
+    
+            hdr['EXTNAME'] = 'psf'
+            hdulist.append(fits.ImageHDU(psfstamp_all, None))
+    
         hdulist.close(closed=True)
+
+
+   

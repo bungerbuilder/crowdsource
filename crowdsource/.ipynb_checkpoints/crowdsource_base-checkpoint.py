@@ -21,6 +21,8 @@ import pdb
 import crowdsource.psf as psfmod
 import scipy.ndimage.filters as filters
 from collections import OrderedDict
+from scipy import sparse
+from typing import List, Tuple, Optional
 
 nodeblend_maskbit = 2**30
 sharp_maskbit = 2**31
@@ -78,7 +80,7 @@ def significance_image(im, model, isig, psf, sz=19):
     return sigim*numpy.sqrt(ivarim), modim*numpy.sqrt(ivarim)
 
 
-def significance_image_multi(ims, models, isigs, psfs, weights=None, sz=19):
+def significance_image_multiband(ims, models, isigs, psfs, band_weights=None, sz=19):
     """
     Joint matched-filter significance image for a list of bands, without local background fit
 
@@ -105,15 +107,14 @@ def significance_image_multi(ims, models, isigs, psfs, weights=None, sz=19):
     """
 
     nband = len(ims)
-    if weights is None:
-        weights = [1.0/nband] * nband
+    if band_weights is None: band_weights = [1.0/nband] * nband
 
     def convolve(im, kernel):
         from scipy.signal import fftconvolve
         return fftconvolve(im, kernel[::-1, ::-1], mode='same')
 
-    num, den, modnum = 0.0, 0.0, 0.0
-    for w, im, mod, isig, psf in zip(weights, ims, models, isigs, psfs):
+    sigim, modim, varim = 0.0, 0.0, 0.0
+    for w, im, mod, isig, psf in zip(band_weights, ims, models, isigs, psfs):
         psfstamp = psfmod.central_stamp(psf, sz).copy()
         sigim += w * convolve(im   * isig**2, psfstamp)
         modim += w * convolve(mod  * isig**2, psfstamp)
@@ -122,7 +123,8 @@ def significance_image_multi(ims, models, isigs, psfs, weights=None, sz=19):
     varim[varim <= 1e-14] = 0.0
     ivarim = 1. / (varim + (varim == 0) * 1e14)
 
-    return sigim * np.sqrt(ivarim), modim * np.sqrt(ivarim)
+    return sigim * numpy.sqrt(ivarim), modim * numpy.sqrt(ivarim)
+
 
 
 def significance_image_lbs(im, model, isig, psf, sz=19):
@@ -199,6 +201,88 @@ def peakfind(im, model, isig, dq, psf, keepsat=False, threshold=5,
 
     return x[m], y[m]
 
+
+def peakfind_multiband(ims, models, isigs, dq, psfs, *,
+                       band_weights=None, keepsat=False, threshold=5,
+                       blendthreshold=0.3, psfvalsharpcutfac=0.7,
+                       psfsharpsat=0.7, maxfiltershape=3, psfsz=59):
+    """
+    Identify significant, non-blended peaks in a *joint* multiband fit.
+
+    Parameters
+    ----------
+    ims, models, isigs : list of 2-D ndarray (one per band)
+        Sky-subtracted data, current model, and inverse-sigma/weight images.
+    dq : 2-D ndarray or None
+        Combined data-quality mask. 
+    psfs : list of PSF functions, one per band
+    band_weights : list(float), optional
+        Relative weight for each band (must match 'significance_image_multiband').
+    keepsat, threshold, blendthreshold, psfvalsharpcutfac, psfsharpsat,
+    maxfiltershape, psfsz : see single-band 'peakfind'.
+
+    Returns
+    -------
+    x, y : 1-D int arrays
+        Pixel coordinates of accepted peaks.
+    """
+    import numpy as np
+    nband = len(ims)
+    if band_weights is None: band_weights = [1.0 / nband] * nband
+
+    # Joint significance images
+    psfstamp1 = psfs[0](int(ims[0].shape[0]/2.), int(ims[0].shape[1]/2.), deriv=False, stampsz=psfsz)
+    psfstamp2 = psfs[1](int(ims[1].shape[0]/2.), int(ims[1].shape[1]/2.), deriv=False, stampsz=psfsz)
+    psfstamps = [psfstamp1, psfstamp2]
+    sigim, modelsigim = significance_image_multiband(ims, models, isigs, psfstamps, band_weights=band_weights, sz=psfsz)
+
+    # Build *weighted* combined image, model, and isig for the flux / significance ratios.
+    im_tot    = np.sum([w * im    for w, im    in zip(band_weights, ims)],    axis=0)
+    model_tot = np.sum([w * mod   for w, mod   in zip(band_weights, models)], axis=0)
+    isig_tot  = np.sqrt(np.sum([(w * isig)**2 for w, isig in zip(band_weights, isigs)], axis=0))
+    psf_tot  = np.sum([w * psfstamp for w, psfstamp in zip(band_weights, psfstamps)], axis=0)
+
+    # Candidate peaks: same max-filter trick as single band
+    sig_max = filters.maximum_filter(sigim, maxfiltershape)
+    x, y = np.nonzero((sig_max == sigim) & (sigim > threshold) & (keepsat | (isig_tot > 0)))
+
+    # # Candidate peaks: keep joint OR single-band detections
+    # sig_max_joint = filters.maximum_filter(sigim, maxfiltershape)
+    # sig_max_bands = [filters.maximum_filter(s, maxfiltershape) for s in sigims_single]
+    # cand_mask = ((sig_max_joint == sigim) & (sigim > threshold))
+    # for sig_band, sig_max_band in zip(sigims_single, sig_max_bands):
+    #     cand_mask |= ((sig_max_band == sig_band) & (sig_band > threshold))
+    # cand_mask &= (keepsat | (isig_tot > 0))
+    # x, y = np.nonzero(cand_mask)
+    
+    fluxratio  = im_tot[x, y] / np.clip(model_tot[x, y], 0.01, np.inf)
+    sigratio   = (im_tot[x, y] * isig_tot[x, y]) / np.clip(modelsigim[x, y], 0.01, np.inf)
+    sigratio2  = sigim[x, y] / np.clip(modelsigim[x, y], 0.01, np.inf)
+
+    m = ((isig_tot[x, y] > 0) | (keepsat & (isig_tot[x, y] == 0)))    # ~saturated, or saturated & keep
+
+    if dq is not None and np.any(dq[x, y] & nodeblend_maskbit):   # HyperLeda - big galaxies list
+        nodeblend = (dq[x, y] & nodeblend_maskbit) != 0
+        bt = np.ones_like(x) * blendthreshold
+        bt[nodeblend] = 100          
+        blendthreshold = bt           
+        
+    if dq is not None and np.any(dq[x, y] & sharp_maskbit):   # NN nebulosity or very bright stars - sharp them
+        sharp = (dq[x, y] & sharp_maskbit) != 0
+        msharp = ~sharp | psfvalsharpcut(
+            x, y, sigim, isig_tot, psf_tot,
+            psfvalsharpcutfac=psfvalsharpcutfac,
+            psfsharpsat=psfsharpsat
+        )
+        m &= msharp
+
+    # Blend / significance conditions (same algebra as single band)
+    m &= ((sigratio2 > blendthreshold * 2) |
+          ((fluxratio > blendthreshold) &
+           (sigratio >  blendthreshold / 4.) &
+           (sigratio2 > blendthreshold)))
+
+    return x[m], y[m]
 
 def psfvalsharpcut(x, y, sigim, isig, psf, psfvalsharpcutfac=0.7,
                    psfsharpsat=0.7):
@@ -328,7 +412,7 @@ def fit_once(im, x, y, psfs, weight=None,
     weight = numpy.pad(weight, [pad, pad], constant_values=0.,
                        mode='constant')
     weight[weight == 0.] = 1.e-20
-    pix = numpy.arange(stampsz*stampsz, dtype='i4').reshape(stampsz, stampsz)
+    pix = numpy.arange(stampsz*stampsz, dtype='i4').reshape(stampsz, stampsz) #pixel grid to track where each pixel lands on the image
     # convention: x is the first index, y is the second
     # sorry.
     xpix = pix // stampsz
@@ -343,39 +427,40 @@ def fit_once(im, x, y, psfs, weight=None,
     repeat = 1 if not psfderiv else 3
     nskypar = nskyx * nskyy
     npixim = im.shape[0]*im.shape[1]
-    zsz = (repeat*numpy.sum(sz*sz) + nskypar*npixim).astype('i8')
+    zsz = (repeat*numpy.sum(sz*sz) + nskypar*npixim).astype('i8')   #Total number of non-zero entries in the sparse matrix 'A'. Sky parameters take nskypar non-zero entries to be precise, but this way is just easier. 
     if zsz >= 2**32:
         raise ValueError(
             'Number of pixels being fit is too large (>2**32); '
             'failing early.  This usually indicates a problem with '
             'the choice of PSF size & too many sources.')
-    xloc = numpy.zeros(zsz, dtype='i4')
-    values = numpy.zeros(len(xloc), dtype='f4')
-    colnorm = numpy.zeros(len(x)*repeat+nskypar, dtype='f4')
-    first = 0
-    for i in range(len(xe)):
+    xloc = numpy.zeros(zsz, dtype='i4')   #row number (i.e., pixel index) of the non-zero entries
+    values = numpy.zeros(len(xloc), dtype='f4')   #values of the non-zero entries
+    colnorm = numpy.zeros(len(x)*repeat+nskypar, dtype='f4')   #number of columns in 'A' matrix - Compute the norm (magnitude) of the column vector for stability.
+    first = 0   #pointer that tracks where in the xloc and values arrays we will write data.
+    for i in range(len(xe)):  #looping over each source
+        # f and l crops the stamp if it's greater than the psf. f stands for 'first index' and l stands for 'last index' to pick from the psf stamp.
         f = stampszo2-szo2[i]
         l = stampsz - f
-        wt = weight[xe[i]:xe[i]+stampsz, ye[i]:ye[i]+stampsz][f:l, f:l]
+        wt = weight[xe[i]:xe[i]+stampsz, ye[i]:ye[i]+stampsz][f:l, f:l]   #extracts a stampsz x stampsz region from the padded weight map centered around the source. Then crops it to sz
         for j in range(repeat):
             xloc[first:first+sz[i]**2] = (
-                numpy.ravel_multi_index(((xe[i]+xpix[f:l, f:l]),
+                numpy.ravel_multi_index(((xe[i]+xpix[f:l, f:l]),    #gives the actual x,y pixel coordinates of each PSF pixel on the padded image.
                                          (ye[i]+ypix[f:l, f:l])),
                                         im.shape)).reshape(-1)
             # yloc[first:first+sz[i]**2] = i*repeat+j
             values[first:first+sz[i]**2] = (
-                (psfs[j][i][:, :]*wt).reshape(-1))
+                (psfs[j][i][:, :]*wt).reshape(-1))     #stores PSF × weight for each pixel
             colnorm[i*repeat+j] = numpy.sqrt(
                 numpy.sum(values[first:first+sz[i]**2]**2.))
-            colnorm[i*repeat+j] += (colnorm[i*repeat+j] == 0)
+            colnorm[i*repeat+j] += (colnorm[i*repeat+j] == 0)    #Column-wise L2 norm (for scaling and LSQR stability).Otherwise, bright sources (large flux) would dominate the solution.
             values[first:first+sz[i]**2] /= colnorm[i*repeat+j]
             first += sz[i]**2
 
     if nskypar != 0:
         sxloc, syloc, svalues = sky_parameters(nx+pad*2, ny+pad*2,
                                                nskyx, nskyy, weight)
-        startidx = len(x)*repeat
-        nskypix = len(sxloc[0])
+        startidx = len(x)*repeat   #where sky columns begin in matrix (after source columns)
+        nskypix = len(sxloc[0])   #total pixels(rows in A) affected by each sky parameter
         for i in range(len(sxloc)):
             xloc[first:first+nskypix] = sxloc[i]
             # yloc[first:first+nskypix] = startidx+syloc[i]
@@ -383,9 +468,10 @@ def fit_once(im, x, y, psfs, weight=None,
             colnorm[startidx+i] += (colnorm[startidx+i] == 0.)
             values[first:first+nskypix] = svalues[i] / colnorm[startidx+i]
             first += nskypix
-    shape = (im.shape[0]*im.shape[1], len(x)*repeat+nskypar)
+    shape = (im.shape[0]*im.shape[1], len(x)*repeat+nskypar)  #Final shape of the sparse matrix, A
 
     from scipy import sparse
+    #csc_indptr defines the start and end of each column in the sparse matrix. It grows by sz[i]**2 per source column, and by nskypix per sky column
     csc_indptr = numpy.cumsum([sz[i]**2 for i in range(len(x))
                                for j in range(repeat)])
     csc_indptr = numpy.concatenate([[0], csc_indptr])
@@ -406,7 +492,9 @@ def fit_once(im, x, y, psfs, weight=None,
     flux = lsqr_cp(mat, (im*weight).ravel(), atol=1.e-4, btol=1.e-4,
                    guess=guessvec)
     model = mat.dot(flux[0]).reshape(*im.shape)
-    flux[0][:] = flux[0][:] / colnorm
+    flux[0][:] = flux[0][:] / colnorm    #Undo column normalization
+
+    #Crop out the padding region
     im = im[pad:-pad, pad:-pad]
     model = model[pad:-pad, pad:-pad]
     weight = weight[pad:-pad, pad:-pad]
@@ -415,10 +503,234 @@ def fit_once(im, x, y, psfs, weight=None,
                         nx+pad*2, ny+pad*2)
         sky = sky[pad:-pad, pad:-pad]
     else:
-        sky = model * 0
-    model = model / (weight + (weight == 0))
+        sky = model * 0  #return a blank sky image
+        
+    model = model / (weight + (weight == 0))   #Undo the weight multiplication applied earlier to the image
     res = (flux, model, sky)
     return res
+
+def fit_once_multiband(images, x, y, psfs, weights=None,
+                       psfderiv=False, nskyx=0, nskyy=0, guess=None):
+    """
+    Multiband fitting of fluxes for shared (x, y) positions across bands.
+
+    Parameters
+    ----------
+    images : list of ndarray
+        List of sky-subtracted images, one per band.
+    x, y : ndarray
+        Shared source coordinates (length N).
+    psfs : list of list of ndarray
+        psfs[b][j][i] gives PSF stamp for source i and derivatives j (j<=3) in band b.
+    weights : list of ndarray, optional
+        One weight map per band. Defaults to uniform if None.
+    psfderiv : bool
+        Whether PSF derivatives are included (dx, dy).
+    nskyx, nskyy : int
+        Sky model parameterization per band (0 or >=3).
+    guess : ndarray, optional
+        Initial guess vector (flux only, no derivatives).
+
+    Returns
+    -------
+    flux : ndarray
+        Solution vector where flux[0] is of shape (B*N + (2*N if psfderiv) + B*nskypar,), ordered as:
+        [ per-band fluxes (B*N), shared dx (N), shared dy (N), sky params (B*nskypar) ].
+    model : list of ndarray
+        Modeled image for each band.
+    sky : list of ndarray
+        Modeled sky image for each band.
+    """
+
+    B = len(images)
+    N = len(x)
+    sz_b = [numpy.array([psfs[b][0][i].shape[-1] for i in range(N)]) for b in range(B)]
+    szo2_b = [sz // 2 for sz in sz_b]
+    
+    # for safety, I pick a common stampsz across both bands. DOUBT
+    stampsz = max(max(sz) for sz in sz_b) if N > 0 else 19
+    pad = stampsz // 2 + 1
+
+    images_pad = [numpy.pad(im, [pad, pad], constant_values=0.) for im in images]
+    weights_pad = []
+    for b in range(B):
+        if weights is None or weights[b] is None:
+            w = numpy.ones_like(images[b])
+        else:
+            w = weights[b]
+        w = numpy.pad(w, [pad, pad], constant_values=0.)
+        w[w == 0] = 1e-20
+        weights_pad.append(w)
+
+    xp = numpy.round(x).astype('i4')
+    yp = numpy.round(y).astype('i4')
+    xe = xp - stampsz // 2 + pad
+    ye = yp - stampsz // 2 + pad
+
+    pix = numpy.arange(stampsz*stampsz).reshape(stampsz, stampsz)
+    xpix = pix // stampsz
+    ypix = pix % stampsz
+
+    nskypar = nskyx * nskyy
+    npixim = images_pad[0].shape[0] * images_pad[0].shape[1]
+
+    # ---- parameter count ----
+    ncol = B * N                       # fluxes
+    if psfderiv:
+        ncol += 2 * N                  # shared dx, dy per source
+    ncol += B * nskypar                # sky terms
+
+    zsz = (sum(numpy.sum(sz_b[b]**2) for b in range(B)) * (1 + (2 if psfderiv else 0))
+           + B * nskypar * npixim).astype('i8')
+    
+    if zsz >= 2**32: raise ValueError("Too many pixels — check PSF size and sources")
+
+    xloc = numpy.zeros(zsz, dtype='i4')
+    values = numpy.zeros(zsz, dtype='f4')
+    colnorm = numpy.zeros(ncol, dtype='f4')
+
+    first = 0
+    # --- flux columns ---
+    for b in range(B):
+        for i in range(N):
+            f = stampsz // 2 - szo2_b[b][i]
+            l = stampsz - f
+            wt = weights_pad[b][xe[i]:xe[i]+stampsz, ye[i]:ye[i]+stampsz][f:l, f:l]
+
+            xloc[first:first+sz_b[b][i]**2] = (
+                numpy.ravel_multi_index(((xe[i]+xpix[f:l, f:l]),
+                                         (ye[i]+ypix[f:l, f:l])),
+                                         images_pad[b].shape).reshape(-1)
+                + b * npixim
+            )
+            values[first:first+sz_b[b][i]**2] = (psfs[b][0][i] * wt).reshape(-1)
+            col_idx = b * N + i
+            colnorm[col_idx] = numpy.sqrt(numpy.sum(values[first:first+sz_b[b][i]**2]**2.))
+            colnorm[col_idx] += (colnorm[col_idx] == 0)
+            values[first:first+sz_b[b][i]**2] /= colnorm[col_idx]
+            first += sz_b[b][i]**2
+
+    # --- shared derivative columns ---
+    if psfderiv:
+        for i in range(N):
+            for d, j in enumerate([1, 2]):  # dx, dy
+                col_idx = B * N + 2*i + d
+                vals = []
+                idxs = []
+                for b in range(B):
+                    f = stampsz // 2 - szo2_b[b][i]
+                    l = stampsz - f
+                    wt = weights_pad[b][xe[i]:xe[i]+stampsz, ye[i]:ye[i]+stampsz][f:l, f:l]
+                    pix_idx = (
+                        numpy.ravel_multi_index(((xe[i]+xpix[f:l, f:l]),
+                                                 (ye[i]+ypix[f:l, f:l])),
+                                                 images_pad[b].shape).reshape(-1)
+                        + b * npixim
+                    )
+                    if guess is not None:
+                        vals.append((guess[b*N + i] * psfs[b][j][i] * wt).reshape(-1))   #Multiply guessflux so we directly get the centroid shifts without math.
+                    else:
+                        vals.append((psfs[b][j][i] * wt).reshape(-1))   
+                    idxs.append(pix_idx)
+                idxs = numpy.concatenate(idxs)
+                vals = numpy.concatenate(vals)
+                colnorm[col_idx] = numpy.sqrt(numpy.sum(vals**2)) or 1.0
+                values[first:first+len(vals)] = vals / colnorm[col_idx]
+                xloc[first:first+len(vals)] = idxs
+                first += len(vals)
+
+
+    if nskypar > 0:
+        for b in range(B):
+            sxloc, syloc, svalues = sky_parameters(
+                images[b].shape[0] + 2*pad, images[b].shape[1] + 2*pad,
+                nskyx, nskyy, weights_pad[b]
+            )
+            startidx = (B * N + (2*N if psfderiv else 0)) + b * nskypar
+            for i in range(len(sxloc)):
+                xloc[first:first+len(sxloc[i])] = sxloc[i] + b * npixim
+                colnorm[startidx + syloc[i]] = numpy.sqrt(numpy.sum(svalues[i]**2.))
+                colnorm[startidx + syloc[i]] += (colnorm[startidx + syloc[i]] == 0)
+                values[first:first+len(sxloc[i])] = svalues[i] / colnorm[startidx + syloc[i]]
+                first += len(sxloc[i])
+
+    shape = (B * npixim, ncol)
+
+    # csc_indptr = []    # # list to hold the number of nonzeros in each column
+    csc_indptr = [0]   # always start at 0
+    
+    # --- Flux columns (per band)---
+    for b in range(B):                  # loop over bands
+        for i in range(N):              # loop over sources
+            nnz = sz_b[b][i]**2         # each flux column has PSF stamp pixels
+            csc_indptr.append(csc_indptr[-1] + nnz)
+    
+    # --- Shared derivative columns ---
+    if psfderiv:
+        for i in range(N):              # loop over sources
+            # dx column
+            nnz_dx = sum(sz_b[b][i]**2 for b in range(B))  # one combined column across all bands
+            csc_indptr.append(csc_indptr[-1] + nnz_dx)
+    
+            # dy column
+            nnz_dy = sum(sz_b[b][i]**2 for b in range(B))  # same size as dx
+            csc_indptr.append(csc_indptr[-1] + nnz_dy)
+    
+    # --- Sky columns (per band) ---
+    if nskypar > 0:
+        for b in range(B):
+            for _ in range(nskypar):
+                csc_indptr.append(csc_indptr[-1] + npixim)
+                # each sky basis spans the whole image, so nnz = npixim
+
+    mat = sparse.csc_matrix((values, xloc, csc_indptr), shape=shape, dtype='f4')
+
+    if guess is not None:
+        # total parameter count = ncol = B * N + (2 * N if psfderiv else 0) + B * nskypar
+        guessvec = numpy.zeros(ncol, dtype='f4')
+        for b in range(B):
+            start = b * N; end = (b + 1) * N
+            guessvec[start:end] = guess[start:end]  # Fill only the flux slots
+    
+        # --- sky guesses ---
+        if nskypar > 0:
+            # take last B*nskypar entries of guess for sky params
+            guessvec[-B * nskypar:] = guess[-B * nskypar:]
+        guessvec *= colnorm
+    else: guessvec = None
+
+
+    rhs = numpy.concatenate([(images_pad[b]*weights_pad[b]).ravel() for b in range(B)])
+    # print("rhs.shape before lsqr_cp:", rhs.shape)
+    # print("mat.shape:", mat.shape)
+    flux = lsqr_cp(mat, rhs.ravel(), atol=1.e-4, btol=1.e-4, guess=guessvec)
+    flux_scaled = flux[0].copy()          # still column-normalised to be used for model
+    flux[0] /= colnorm            # Undo column normalization. This will be the returned flux and will be used in sky model
+
+    model = []
+    sky = []
+    # index where sky parameters start
+    sky_offset = B * N + (2 * N if psfderiv else 0)
+    
+    for b in range(B):
+        # --- build model image ---
+        band_model = mat[b * npixim:(b + 1) * npixim, :].dot(flux_scaled)
+        band_model = band_model.reshape(images_pad[b].shape)
+        band_model = band_model[pad:-pad, pad:-pad]
+        weight = weights_pad[b][pad:-pad, pad:-pad] if weights else 1.
+        band_model /= (weight + (weight == 0))
+        model.append(band_model)
+    
+        # --- sky model ---
+        if nskypar > 0:
+            sky_params = flux[0][sky_offset + b * nskypar : sky_offset + (b + 1) * nskypar]
+            skymap = sky_model(sky_params.reshape(nskyx, nskyy),
+                               images[b].shape[0] + 2*pad, images[b].shape[1] + 2*pad)
+            sky.append(skymap[pad:-pad, pad:-pad])
+        else:
+            sky.append(numpy.zeros_like(model[-1]))
+
+    return flux, numpy.array(model), numpy.array(sky)
 
 
 def unpack_fitpar(guess, nsource, psfderiv):
@@ -477,57 +789,94 @@ def compute_centroids(x, y, psflist, flux, im, resid, weight,
     # have been subtracted off.
     # we construct this image by taking the residual image, and then
     # star-by-star adding the model back.
+
+    # ---------------------------
+    # KEEP (stamps): build PSF stamps centered to 'centroidsize'
+    # ---------------------------
+
     psfs = [numpy.zeros((len(x), centroidsize, centroidsize), dtype='f4')
             for i in range(len(psflist))]
+    
     for j in range(len(psflist)):
         for i in range(len(x)):
-            psfs[j][i, :, :] = psfmod.central_stamp(psflist[j][i],
-                                                    censize=centroidsize)
+            psf_stamp = psfmod.central_stamp(psflist[j][i], censize=centroidsize)
+            if numpy.all(psf_stamp == 0):
+                # Fallback: rebuild from canonical PSF at (x[i], y[i])
+                psf_stamp = psfmod.central_stamp(psflist[j][i], censize=centroidsize, force_center=True)
+                if psf_stamp is None or np.all(psf_stamp == 0):
+                    print(f"[repair-final] source {i}, comp {j}: could not restore PSF stamp")
+            psfs[j][i, :, :] = psf_stamp
+        
+    
+    # for j in range(len(psflist)):
+    #     for i in range(len(x)):
+    #         psfs[j][i, :, :] = psfmod.central_stamp(psflist[j][i],
+    #                                                 censize=centroidsize)
+
     stampsz = psfs[0].shape[-1]
     stampszo2 = (stampsz-1)//2
-    dx = numpy.arange(stampsz, dtype='i4')-stampszo2
-    dx = dx.reshape(-1, 1)
-    dy = dx.copy().reshape(1, -1)
+
+    # ---------------------------
+    # REMOVE (centroid math): pixel coordinate grids used for integrals
+    # ---------------------------
+    # dx = numpy.arange(stampsz, dtype='i4')-stampszo2
+    # dx = dx.reshape(-1, 1)
+    # dy = dx.copy().reshape(1, -1)
+
+    # ---------------------------
+    # KEEP (stamps): source centers & padding for stamp extraction
+    # ---------------------------
     xp = numpy.round(x).astype('i4')
     yp = numpy.round(y).astype('i4')
-    # subtracting to get to the edge of the stamp, adding back to deal with
-    # the padded image.
+    # subtracting to get to the edge of the stamp, adding back to deal with the padded image.
     xe = xp - stampszo2 + stampszo2
     ye = yp - stampszo2 + stampszo2
-    resid = numpy.pad(resid, [stampszo2, stampszo2], constant_values=0.,
-                      mode='constant')
-    weight = numpy.pad(weight, [stampszo2, stampszo2], constant_values=0.,
-                       mode='constant')
-    im = numpy.pad(im, [stampszo2, stampszo2], constant_values=0.,
-                   mode='constant')
+    resid = numpy.pad(resid, [stampszo2, stampszo2], constant_values=0., mode='constant')
+    weight = numpy.pad(weight, [stampszo2, stampszo2], constant_values=0., mode='constant')
+    im = numpy.pad(im, [stampszo2, stampszo2], constant_values=0., mode='constant')
     repeat = len(psflist)
-    residst = numpy.array([resid[xe0:xe0+stampsz, ye0:ye0+stampsz]
-                           for (xe0, ye0) in zip(xe, ye)])
-    weightst = numpy.array([weight[xe0:xe0+stampsz, ye0:ye0+stampsz]
-                            for (xe0, ye0) in zip(xe, ye)])
+
+    # ---------------------------
+    # KEEP (stamps): extract residual/data/weight stamps
+    # ---------------------------
+    residst = numpy.array([resid[xe0:xe0+stampsz, ye0:ye0+stampsz] for (xe0, ye0) in zip(xe, ye)])
+    weightst = numpy.array([weight[xe0:xe0+stampsz, ye0:ye0+stampsz] for (xe0, ye0) in zip(xe, ye)])
     psfst = psfs[0] * flux[:len(x)*repeat:repeat].reshape(-1, 1, 1)
-    imst = numpy.array([im[xe0:xe0+stampsz, ye0:ye0+stampsz]
-                        for (xe0, ye0) in zip(xe, ye)])
+    imst = numpy.array([im[xe0:xe0+stampsz, ye0:ye0+stampsz] for (xe0, ye0) in zip(xe, ye)])
+
     if len(x) == 0:
+        # KEEP (stamps): empty-safe fallbacks
         weightst = psfs[0].copy()
         residst = psfs[0].copy()
         imst = psfs[0].copy()
+
+    # ---------------------------
+    # KEEP (stamps): reconstruct model stamp (adds derivative comps if present)
+    # ---------------------------
     modelst = psfst.copy()
     if len(psflist) > 1:
         modelst += psfs[1]*flux[1:len(x)*repeat:repeat].reshape(-1, 1, 1)
         modelst += psfs[2]*flux[2:len(x)*repeat:repeat].reshape(-1, 1, 1)
-    cen = []
-    ppw = numpy.sum(modelst*modelst*weightst, axis=(1, 2))
-    pp = numpy.sum(modelst*modelst, axis=(1, 2))
-    for dc in (dx, dy):
-        xrpw = numpy.sum(dc[None, :, :]*residst*modelst*weightst, axis=(1, 2))
-        xmmpm = numpy.sum(dc[None, :, :]*(modelst-psfst)*modelst, axis=(1, 2))
-        cen.append(2*xrpw/(ppw + (ppw == 0.))*(ppw != 0.) +
-                   2*xmmpm/(pp + (pp == 0.))*(pp != 0.))
-    xcen, ycen = cen
-    norm = numpy.sum(modelst, axis=(1, 2))
-    norm = norm + (norm == 0)
-    psfqf = numpy.sum(modelst*(weightst > 0), axis=(1, 2)) / norm
+
+    # ---------------------------
+    # REMOVE (centroid math): integral-based centroid estimator and correction
+    # ---------------------------
+    # cen = []
+    # ppw = numpy.sum(modelst*modelst*weightst, axis=(1, 2))
+    # pp = numpy.sum(modelst*modelst, axis=(1, 2))
+    # for dc in (dx, dy):
+    #     xrpw = numpy.sum(dc[None, :, :]*residst*modelst*weightst, axis=(1, 2))
+    #     xmmpm = numpy.sum(dc[None, :, :]*(modelst-psfst)*modelst, axis=(1, 2))
+    #     cen.append(2*xrpw/(ppw + (ppw == 0.))*(ppw != 0.) +
+    #                2*xmmpm/(pp + (pp == 0.))*(pp != 0.))
+    # xcen, ycen = cen
+
+    # ---------------------------
+    # REMOVE (centroid gating/fallback): psf quality fraction & derivative fallback
+    # ---------------------------
+    # norm = numpy.sum(modelst, axis=(1, 2))
+    # norm = norm + (norm == 0)
+    # psfqf = numpy.sum(modelst*(weightst > 0), axis=(1, 2)) / norm
     # how should we really be doing this?  derivcentroids is the first order
     # approximation to the right thing.  the centroid computation that I do
     # otherwise should be unbiased but noisier than optimal for significantly
@@ -538,26 +887,127 @@ def compute_centroids(x, y, psflist, flux, im, resid, weight,
     # well, so this is probably a worthwhile thing to try.  if it worked, it
     # would obviate some of the code mess above, and be optimal, so that
     # sounds worthwhile.
-    if not derivcentroids:
-        m = psfqf < 0.5
-    else:
-        m = numpy.ones(len(xcen), dtype='bool')
-    xcen[m] = 0.
-    ycen[m] = 0.
-    if (len(psflist) > 1) and numpy.sum(m) > 0:
-        ind = numpy.flatnonzero(m)
-        # just use the derivative-based centroids for this case.
-        fluxnz = flux[repeat*ind]
-        fluxnz = fluxnz + (fluxnz == 0)
-        xcen[ind] = flux[repeat*ind+1]/fluxnz
-        ycen[ind] = flux[repeat*ind+2]/fluxnz
+    
+    # if not derivcentroids:
+    #     m = psfqf < 0.5
+    # else:
+    #     m = numpy.ones(len(xcen), dtype='bool')
+    # xcen[m] = 0.
+    # ycen[m] = 0.
+    # if (len(psflist) > 1) and numpy.sum(m) > 0:
+    #     ind = numpy.flatnonzero(m)
+    #     # just use the derivative-based centroids for this case.
+    #     fluxnz = flux[repeat*ind]
+    #     fluxnz = fluxnz + (fluxnz == 0)
+    #     xcen[ind] = flux[repeat*ind+1]/fluxnz
+    #     ycen[ind] = flux[repeat*ind+2]/fluxnz
+
+    # ---------------------------
+    # NEW: centroid outputs are zeros; stamps are unchanged
+    # ---------------------------
+    xcen = numpy.zeros(len(x), dtype='f4')
+    ycen = numpy.zeros(len(x), dtype='f4')
+
+    if numpy.any([numpy.all(w == 0) for w in weightst]):
+        print("Warning: empty weight stamp for some sources")
+
+
     # stamps: 0: neighbor-subtracted images,
     # 1: images,
     # 2: psfs with shifts
     # 3: weights
     # 4: psfs without shifts
+    # print("modelst = psfstack from compute_centroids. Prinitng modelst[0][0], modelst[1][0], modelst[2][0], modelst[3][0] in order", modelst[0][0], modelst[1][0], modelst[2][0], modelst[3][0])
     res = (xcen, ycen, (modelst+residst, imst, modelst, weightst, psfst))
     return res
+
+
+def compute_centroids_multiband(x, y, psflists, flux, images, resids, weights, 
+                                derivcentroids=False, centroidsize=19):
+    """
+    Stamp-only multiband wrapper for centroid computation.
+
+    Parameters
+    ----------
+    images : list of ndarray
+        Sky-subtracted images, one per band.
+    x, y : ndarray
+        Shared source coordinates (length N).
+    psflists : list of list of ndarray
+        psflists[b][j][i] gives PSF stamp for source i and derivative j in band b.
+    weights : list of ndarray
+        One weight map per band.
+    flux : ndarray
+        Flattened flux vector from fit_once_multiband.
+        Layout is:
+          [ f^(1)_1...f^(1)_N, f^(2)_1...f^(2)_N, ..., f^(B)_1...f^(B)_N,
+            (optional) dx_1, dy_1, dx_2, dy_2, ..., dx_N, dy_N,
+            (optional) sky params ... ]
+    resids : list of ndarray
+        Residual images per band (= data - model - sky).
+    derivcentroids : bool
+        If True, include derivative PSFs (not actually used now, centroids forced to 0).
+    centroidsize : int
+        Side length of cutout stamps.
+
+    Returns
+    -------
+    xcen, ycen : ndarray
+        Dummy centroids (zeros).
+    stamps : tuple of ndarrays
+        Each element has shape (B, N, S, S):
+        (model+resid, data, model, weight, psf*flux).
+    """
+    import numpy as np
+    B = len(images)
+    N = len(x)
+    base_flux_len = B * N
+    has_deriv = len(flux) >= base_flux_len + 2 * N
+    deriv_offset = base_flux_len if has_deriv else None
+
+    stamps_b = []
+    for b in range(B):
+        # --- slice flux block for this band ---
+        start = b * N
+        stop  = (b + 1) * N
+        flux_band = flux[start:stop]
+
+        # --- repack into stride-3 style expected by compute_centroids ---
+        # inside compute_centroids_multiband, per band b
+        Kb = len(psflists[b])   # 1 (last iter) or 3 (earlier iters)
+        
+        if Kb == 3:
+            # stride-3 interleaved (f, dx, dy) as I have now
+            flux_b = np.zeros(3 * N, dtype='f4')
+            flux_b[0:3*N:3] = flux_band
+            # only fill dx,dy if they truly exist in the global flux:
+            if len(flux) >= base_flux_len + 2*N:
+                dx_block = flux[base_flux_len : base_flux_len + 2*N : 2]
+                dy_block = flux[base_flux_len+1 : base_flux_len + 2*N : 2]
+                flux_b[1:3*N:3] = dx_block
+                flux_b[2:3*N:3] = dy_block
+        else:
+            # PSF-only: pass a length-N vector, no padding with zeros
+            flux_b = flux_band
+
+        if has_deriv:
+            dx_block = flux[deriv_offset : deriv_offset + 2*N : 2]
+            dy_block = flux[deriv_offset+1 : deriv_offset + 2*N : 2]
+            flux_b[1:3*N:3] = dx_block
+            flux_b[2:3*N:3] = dy_block
+
+        # pass to single-band centroid computation
+        _, _, stamps = compute_centroids(
+            x, y, psflists[b], flux_b,
+            images[b], resids[b], weights[b],
+            derivcentroids=derivcentroids, centroidsize=centroidsize
+        )
+        stamps_b.append(stamps)
+
+    # stack per element across bands -> (B, N, S, S)
+    stacked = tuple( np.stack([st[idx] for st in stamps_b], axis=0) for idx in range(len(stamps_b[0])))    # collect element idx across all bands
+
+    return np.zeros(N, dtype='f4'), np.zeros(N, dtype='f4'), stacked
 
 
 def estimate_sky_background(im):
@@ -787,6 +1237,7 @@ def refit_psf_from_stamps(psf, x, y, xcen, ycen, stamps, name=None,
     return psf, xnew, ynew
 
 
+
 def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
            nskyx=0, nskyy=0, refit_psf=False,
            verbose=False, miniter=4, maxiter=10, blist=None,
@@ -794,6 +1245,7 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
            ntilex=1, ntiley=1, fewstars=100, threshold=5,
            ccd=None, plot=False, titer_thresh=2, blendthreshu=2,
            psfvalsharpcutfac=0.7, psfsharpsat=0.7):
+    
     if isinstance(weight, int):
         weight = numpy.ones_like(im)*weight
 
@@ -819,6 +1271,8 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
         if titer != lastiter:
             # in first passes, do not split sources!
             blendthresh = blendthreshu if titer < titer_thresh else 0.2
+
+
             xn, yn = peakfind(im-model-hsky,
                               model-msky, weight, dq, psf,
                               keepsat=(titer == 0),
@@ -826,8 +1280,12 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
                               threshold=threshold,
                               psfvalsharpcutfac=psfvalsharpcutfac,
                               psfsharpsat=psfsharpsat)
+
+            # print("Iter", titer, "new peak count:", len(xn))
+            # print("Residual stats:", numpy.mean(im - model - hsky), numpy.std(im - model - hsky))
+            
             if len(xa) > 0 and len(xn) > 0:
-                keep = neighbor_dist(xn, yn, xa, ya) > 1.5
+                keep = neighbor_dist(xn, yn, xa, ya) > 1.5   ### DOUBT - How to decide the threshold?
                 xn, yn = (c[keep] for c in (xn, yn))
             if (titer == 0) and (blist is not None):
                 xnb, ynb = add_bright_stars(xn, yn, blist, im)
@@ -917,24 +1375,63 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
             import gc
             gc.collect()
 
-        centroids = compute_centroids(xa, ya, psfs, flux, im-(sky+msky),
-                                      im-model-sky,
-                                      weight, derivcentroids=derivcentroids)
+        ## Old centroiding call (redundant after derivative-based centroids in fit_once). We perform the next block instead.
+        # centroids = compute_centroids(xa, ya, psfs, flux, im-(sky+msky),
+        #                               im-model-sky,
+        #                               weight, derivcentroids=derivcentroids)
+        # xcen, ycen, stamps = centroids
+        
+        ## ----- NEW: centroid shifts from derivative coefficients -----
+        ## Compute xcen,ycen from the linear-fit derivative amplitudes (Fx/F, Fy/F)
+        ## rather than from compute_centroids() integrals.
+        N = len(xa)
+        if N == 0:
+            xcen = numpy.zeros(0, dtype='f4')
+            ycen = numpy.zeros(0, dtype='f4')
+        else:
+            # repeat corresponds to this iteration's derivative setting
+            # (already set above as: repeat = 1 + tpsfderiv*2)
+            if repeat > 1:
+                F  = flux[0:N*repeat:repeat]
+                Fx = flux[1:N*repeat:repeat]
+                Fy = flux[2:N*repeat:repeat]
+                eps = 1e-20
+                xcen = (Fx / (F + eps)).astype('f4')
+                ycen = (Fy / (F + eps)).astype('f4')
+            else:
+                # Final pass (tpsfderiv=False) or no-deriv mode: no shift
+                xcen = numpy.zeros(N, dtype='f4')
+                ycen = numpy.zeros(N, dtype='f4')
 
-        xcen, ycen, stamps = centroids
+        ## ----- KEEP: build stamps (compute_centroids is now stamp-only) -----
+        ## We still need stamps for compute_stats, PSF refit, and fluxunc below.
+        _, _, stamps = compute_centroids(
+            xa, ya, psfs, flux,
+            im-(sky+msky),          # 'im' argument (data minus sky)
+            im-model-sky,           # 'resid' argument (neighbor-subtracted residual)
+            weight,
+            derivcentroids=derivcentroids
+        )
+
         if titer == lastiter:
             stats = compute_stats(xa-numpy.round(xa), ya-numpy.round(ya),
-                                  stamps[0], stamps[2],
-                                  stamps[3], stamps[1],
+                                  stamps[0], stamps[1],
+                                  stamps[2], stamps[3],
                                   flux)
             if dq is not None:
                 stats['flags'] = extract_im(xa, ya, dq).astype('i4')
             stats['sky'] = extract_im(xa, ya, sky+msky).astype('f4')
+
+            # print("N candidates before pruning:", len(xa))
+            # print("Kept after brightenough:", numpy.sum(brightenough))
+            # print("Kept after isolatedenough:", numpy.sum(isolatedenough))
+            # print("Final:", numpy.sum(keep))
+
             break
         guessflux = flux[:len(xa)*repeat:repeat]
         if refit_psf and len(xa) > 0:
-            psf, xa, ya = refit_psf_from_stamps(
-                psf, xa, ya, xcen, ycen, stamps, name=(titer, ccd), plot=plot)
+            psf, xa, ya = refit_psf_from_stamps(psf, xa, ya, xcen, ycen, stamps, name=(titer, ccd), plot=plot)
+            
         # enforce maximum step
         if derivcentroids:
             maxstep = 1
@@ -953,7 +1450,7 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
         # (small) stamp is saturated.
         # these stars all have very bright inferred fluxes
         # i.e., 50k saturates, so we can cut there.
-        brightenough = (guessflux/fluxunc > threshold*3/5.) | (guessflux > 1e5)
+        brightenough = (guessflux/fluxunc > threshold*3/5.) | (guessflux > 1e5)     
         isolatedenough = cull_near(xa, ya, guessflux)
 
         keep = brightenough & isolatedenough
@@ -985,38 +1482,439 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
     return res
 
 
-def compute_stats(xs, ys, impsfstack, psfstack, weightstack, imstack, flux):
+def fit_im_multiband(images, psfb, weights=None, dq
+                     =None, band_weights=None, psfderiv=True,
+                     nskyx=0, nskyy=0, refit_psf=False,
+                     verbose=False, miniter=4, maxiter=10, blist=None,
+                     maxstars=40000, derivcentroids=False,
+                     ntilex=1, ntiley=1, fewstars=100, threshold=5,
+                     ccd=None, plot=False, titer_thresh=2, blendthreshu=2,
+                     psfvalsharpcutfac=0.7, psfsharpsat=0.7):
+    """
+    Multiband version of fit_im:
+    - Fits fluxes for shared source positions across multiple bands.
+    - Uses fit_once_multiband, compute_centroids_multiband and compute_stats_multiband.
+    """
+
+    import numpy as np
+    from collections import OrderedDict
+    import gc, time
+
+    B = len(images)   # number of bands
+    shape = images[0].shape
+
+    models = [np.zeros_like(im) for im in images]
+    mskys  = [np.zeros_like(im) for im in images]
+    xa = np.zeros(0, dtype='f4')
+    ya = xa.copy()
+    passno = np.zeros(0, dtype='i4')
+    guessflux, guesssky = None, None
+    titer, lastiter = -1, -1
+    skypar = {}  # per-tile sky params
+    nskypar = nskyx * nskyy
+
+    # Estimate rough FWHM from first band’s PSF
+    roughfwhm = psfmod.neff_fwhm(psfb[0](shape[0]//2, shape[1]//2))
+    roughfwhm = np.max([roughfwhm, 3.])
+
+    while True:
+        titer += 1
+
+        # Estimate sky backgrounds separately per band
+        hskys, lskys = [], []
+        for b in range(B):
+            hskys.append(sky_im(images[b]-models[b], weight=weights[b], npix=20))
+            lskys.append(sky_im(images[b]-models[b], weight=weights[b], npix=50*roughfwhm))
+
+        if titer != lastiter:
+            # --- Peak finding ---
+            blendthresh = blendthreshu if titer < titer_thresh else 0.2
+
+            xn, yn = peakfind_multiband([images[b] - models[b] - hskys[b] for b in range(B)],
+                              [models[b] - mskys[b] for b in range(B)], weights, dq, psfb,
+                              band_weights = band_weights,
+                              keepsat=(titer == 0),
+                              blendthreshold=blendthresh,
+                              threshold=threshold,
+                              psfvalsharpcutfac=psfvalsharpcutfac,
+                              psfsharpsat=psfsharpsat)
+            
+            # Remove duplicates near existing sources
+            if len(xa) > 0 and len(xn) > 0:
+                keep = neighbor_dist(xn, yn, xa, ya) > 1.5   
+                xn, yn = (c[keep] for c in (xn, yn))
+
+            # Add bright-star list if provided
+            if (titer == 0) and (blist is not None):
+                xnb, ynb = add_bright_stars(xn, yn, blist, coadd_im)
+                xn = np.concatenate([xn, xnb]).astype('f4')
+                yn = np.concatenate([yn, ynb]).astype('f4')
+
+            xa = np.concatenate([xa, xn]).astype('f4')
+            ya = np.concatenate([ya, yn]).astype('f4')
+            passno = np.concatenate([passno, np.zeros(len(xn))+titer])
+        else:
+            xn, yn = np.zeros(0, dtype='f4'), np.zeros(0, dtype='f4')
+
+        # Decide stopping criterion
+        if titer != lastiter:
+            if (titer == maxiter-1) or (
+                (titer >= miniter-1) and (len(xn) < fewstars)) or (
+                len(xa) > maxstars):
+                lastiter = titer + 1
+            
+        # --- Prepare PSFs and flux arrays per band ---
+        minsz_b, sz_b = [], []
+        for b in range(B):
+            resid  = images[b] - hskys[b] - mskys[b]
+            sz = get_sizes(xa, ya, resid, weight=weights[b], blist=blist)
+            sz_b.append(sz)
+            minsz_b.append(np.min(sz) if len(sz) else 19)
+
+
+        N = len(xa)
+        if guessflux is not None:
+            guess = np.concatenate([guessflux, np.zeros_like(xn).repeat(B)])   # (B*N,)
+        else: guess = None
+
+        skys = hskys if titer >= 2 else lskys
+
+        # I only use this to decide how many PSF components we build (1 or 3).
+        tpsfderiv = psfderiv if lastiter != titer else False
+        n_psfcomps = 3 if tpsfderiv else 1
+
+        # PSF stamps per band
+        psf_stamps = [[np.zeros((len(xa), minsz_b[b], minsz_b[b]), dtype='f4')
+                       for _ in range(n_psfcomps)] for b in range(B)]
+
+        # [B*N fluxes] + [(2*N) shared deriv if enabled] + [B*nskypar sky]
+        ncol_global = B*N + (2*N if tpsfderiv else 0) + B*nskypar
+        flux = np.zeros(ncol_global, dtype='f4')
+
+        if verbose:
+            subreg_iter = 0
+            t0 = time.time()
+            print("Starting subregion iterations")
+                    
+        # --- Loop over image subregions ---
+        for (bdxf, bdxl, bdxaf, bdxal, bdyf, bdyl, bdyaf, bdyal) in (
+                subregions(shape, ntilex, ntiley)):
+        
+            if verbose:
+                print(f"Subregion iteration {subreg_iter} starting; dt={time.time()-t0}", flush=True)
+                subreg_iter += 1
+        
+            # Sources in this subregion (shared positions across all bands)
+            mbda_sources = in_bounds(xa, ya, [bdxaf-0.5, bdxal-0.5], [bdyaf-0.5, bdyal-0.5])
+            mbd = in_bounds(xa, ya, [bdxf-0.5, bdxl-0.5], [bdyf-0.5, bdyl-0.5])
+        
+            # Expand to band-space indices for flux/guess (flat [B*N])
+            mbda = np.concatenate([b*len(xa) + mbda_sources for b in range(B)])
+        
+            # Extract cutouts per band
+            sall = np.s_[bdxaf:bdxal, bdyaf:bdyal]
+            spri = np.s_[bdxf:bdxl, bdyf:bdyl]
+        
+            dx, dy = bdxal-bdxaf, bdyal-bdyaf
+            sfit = np.s_[bdxf-bdxaf:dx+bdxl-bdxal, bdyf-bdyaf:dy+bdyl-bdyal]
+        
+            # Build PSF lists, images and weights tiles per band
+            psfsbda = [build_psf_list(xa[mbda_sources], ya[mbda_sources], psfb[b], sz_b[b][mbda_sources], psfderiv=tpsfderiv) for b in range(B)]
+            imgs_tile    = [images[b][sall]  - skys[b][sall] for b in range(B)]
+            weights_tile = [weights[b][sall] for b in range(B)]
+        
+            # initialize skypar entry for this tile if missing
+            if (bdxf, bdyf) not in skypar:
+                skypar[(bdxf, bdyf)] = np.zeros(B * nskypar, dtype='f4')
+
+            if guess is not None:
+                ind = np.flatnonzero(mbda_sources)   # fitted sources (reuse same 'ind')
+                M   = len(ind)
+                guess_local_flux = []
+                for b in range(B):
+                    band_block = guess[b*N:(b+1)*N]  # (N,)
+                    guess_local_flux.append(band_block[ind].astype('f4'))  # (M,)
+                guess_local_flux = np.concatenate(guess_local_flux)        # (B*M,)
+                guessmbda = (np.concatenate([guess_local_flux, skypar[(bdxf, bdyf)]])
+                             if nskypar > 0 else guess_local_flux)
+            else:
+                guessmbda = None
+
+        
+            # --- Run joint multiband fit ---
+            tflux, tmodels, tmskys = fit_once_multiband(
+                imgs_tile,
+                xa[mbda_sources] - bdxaf,   # positions (shared across bands)
+                ya[mbda_sources] - bdyaf,
+                psfsbda,
+                psfderiv=tpsfderiv,
+                weights=weights_tile,
+                guess=guessmbda,
+                nskyx=nskyx, nskyy=nskyy,
+            )
+        
+            # --- Accumulate ---
+            for b in range(B):
+                models[b][spri] = tmodels[b][sfit]
+                mskys[b][spri]  = tmskys[b][sfit]
+        
+            # Store fluxes back into global flat array
+            ind  = np.flatnonzero(mbda_sources)                # global source indices in tile
+            ind2 = np.arange(len(ind))
+            M = len(ind2)
+
+            for b in range(B):
+                loc_start = b*M
+                loc_stop  = (b+1)*M
+                # insert into global [b*N : (b+1)*N] at positions 'ind'
+                glob_start = b*N
+                flux[glob_start + ind] = tflux[0][loc_start:loc_stop]
+
+            # Scatter *shared derivatives* (if present): global deriv block starts at B*N
+            if tpsfderiv and M > 0:
+                deriv_off_glob = B * N
+                deriv_off_loc  = B * M      # after the B*M flux block locally
+
+                # dx (even), dy (odd) interleaved per source locally
+                dx_loc = tflux[0][deriv_off_loc     : deriv_off_loc + 2*M : 2]
+                dy_loc = tflux[0][deriv_off_loc + 1 : deriv_off_loc + 2*M : 2]
+
+                flux[deriv_off_glob + 2*ind    ] = dx_loc
+                flux[deriv_off_glob + 2*ind + 1] = dy_loc
+
+            # --- Update per-tile sky parameters (B*nskypar) ---
+            if nskypar > 0:
+                skypar[(bdxf, bdyf)] = tflux[0][-B*nskypar:].copy()
+
+            for b in range(B):
+                if M > 0:
+                    for k in range(n_psfcomps):
+                        psf_block = np.stack(
+                            [psfmod.central_stamp(psfsbda[b][k][tind], minsz_b[b]) for tind in ind2],
+                            axis=0
+                        ).astype('f4')  # (M, S, S)
+            
+                        # Insert into the global psf_stamps
+                        psf_stamps[b][k][mbda_sources] = psf_block
+
+            # free memory
+            del psfsbda
+            gc.collect()
+        
+        # --- Build stamps for compute_stats ---
+        _, _, stamps = compute_centroids_multiband(
+            xa, ya, psf_stamps, flux,
+            [images[b]-(skys[b]+mskys[b]) for b in range(B)],    # 'im' argument
+            [images[b]-models[b]-skys[b] for b in range(B)],     # 'resid' argument
+            [weights[b] for b in range(B)], derivcentroids=derivcentroids)
+        # breakpoint()
+
+        if titer == lastiter:
+            print("LASTITER", lastiter)
+            stats = compute_stats_multiband(xa-np.round(xa), ya-np.round(ya), stamps, flux)
+            if dq is not None:
+                stats['flags'] = extract_im(xa, ya, dq).astype('i4')
+            for b in range(B):
+                stats[f'sky_b{b}'] = extract_im(xa, ya, skys[b]+mskys[b]).astype('f4')
+            break
+                
+        # --- Centroiding --- 
+        N = len(xa)
+        has_deriv_glob = (len(flux) >= B*N + 2*N)
+        if N > 0 and has_deriv_glob:
+            # Shared derivative parameters are exactly centroid shifts (dx, dy) now
+            xcen = flux[B*N : B*N + 2*N : 2].astype('f4')   # (N,)
+            ycen = flux[B*N + 1 : B*N + 2*N : 2].astype('f4')   # (N,)
+        else:
+            xcen = np.zeros(N, dtype='f4')
+            ycen = np.zeros(N, dtype='f4')
+
+        # Optional per-band PSF refit (mirroring single-band API)
+        if refit_psf and N > 0:
+            # stamps from compute_centroids_multiband: each entry has shape (B, N, S, S)
+            # We need per-band single-band-like tuples for refit_psf_from_stamps.
+            # stamps = (impsf, im, model, weight, psf_only)
+            for b in range(B):
+                # Slice per-band stamp tensors
+                impsf_b  = stamps[0][b]
+                im_b     = stamps[1][b]
+                model_b  = stamps[2][b]
+                weight_b = stamps[3][b]
+                psfonly_b = stamps[4][b]
+                stamps_b = (impsf_b, im_b, model_b, weight_b, psfonly_b)
+        
+                psfb[b], xa, ya = refit_psf_from_stamps(
+                    psfb[b], xa, ya, xcen, ycen, stamps_b,
+                    name=(titer, f"{ccd}_b{b}" if ccd is not None else f"b{b}"),
+                    plot=plot
+                )
+        
+        # Enforce maximum centroid step and update (x, y)
+        maxstep = 1.0 if derivcentroids else 3.0
+        dcen = np.sqrt(xcen**2 + ycen**2)
+        m = dcen > maxstep
+        if np.any(m):
+            xcen[m] /= dcen[m]
+            ycen[m] /= dcen[m]
+        
+        # Apply shift and clip to image bounds 
+        xa = np.clip(xa + xcen, -0.499, shape[0] - 0.501)
+        ya = np.clip(ya + ycen, -0.499, shape[1] - 0.501)
+
+        # Build per-band flux uncertainty (B, N) from stamps
+        fluxunc_b = np.sum(stamps[2]**2 * stamps[3]**2, axis=(2, 3))  # (B, N) and stamps shape = (B, N, S, S)
+        fluxunc_b = fluxunc_b + (fluxunc_b == 0) * 1e-20
+        fluxunc_b = (fluxunc_b**(-0.5)).astype('f4')
+
+        ## Checking for weird dflux values
+        if np.any(fluxunc_b > 1e8): print("Huge dflux:", fluxunc_b.max())
+        
+        guessflux_b = np.vstack([flux[b*N:(b+1)*N] for b in range(B)])   # (B, N)
+
+        # Joint SNR across bands
+        snr_b = guessflux_b / (fluxunc_b + 1e-20)            # (B, N)
+        snr_joint = np.sqrt(np.sum(snr_b**2, axis=0))        # (N,)
+
+        # Keep if significant jointly
+        bright_joint   = snr_joint > threshold*3/5.
+        bright_satur   = np.any(guessflux_b > 1e5, axis=0)
+        brightenough =  bright_joint | bright_satur
+
+        # --- Isolation cut across bands ---
+        guessflux_joint = np.max(guessflux_b, axis=0)      # (N,)
+        isolatedenough  = cull_near(xa, ya, snr_joint)
+        
+        keep = brightenough & isolatedenough             # (N,)  <-- 1-D mask
+        xa = xa[keep]
+        ya = ya[keep]
+        passno = passno[keep]
+
+        guessflux_b = guessflux_b[:, keep]
+        guessflux   = guessflux_b.ravel(order='C')   # (B*N_keep,)
+
+        if verbose:
+            print('Extension %s, iteration %2d, found %6d sources; %4d close and %4d faint sources removed.' %
+                  (ccd, titer+1, len(xn),
+                   numpy.sum(~isolatedenough),
+                   numpy.sum(~brightenough & isolatedenough)))
+
+    flux_b = [flux[b*N:(b+1)*N] for b in range(B)]
+    stars = OrderedDict([ ('x', xa), ('y', ya),] +
+                        [(f'flux_b{b}', flux_b[b].astype('f4')) for b in range(B)] + 
+                        [('passno', passno),] +
+                        [(f, stats[f]) for f in stats])
+
+
+    dtypenames = list(stars.keys())
+    dtypeformats = [stars[n].dtype for n in dtypenames]
+    dtype = dict(names=dtypenames, formats=dtypeformats)
+    stars = np.fromiter(zip(*stars.values()),dtype=dtype, count=len(stars['x']))
+
+    return stars, [models[b] + skys[b] for b in range(B)], [skys[b]+mskys[b] for b in range(B)], psfb
+
+
+
+
+def compute_stats(xs, ys, impsfstack, imstack, psfstack, weightstack, flux):
+    """
+    Compute per-source diagnostics (errors, chi2, flux fractions, morphology)
+    from postage stamp cutouts.
+
+    Parameters
+    ----------
+    xs, ys : ndarray
+        Source centroid offsets (subpixel x,y positions).
+    impsfstack : ndarray (N,S,S)
+        Neighbor-subtracted data stamps (model + residual).
+    psfstack : ndarray (N,S,S)
+        Model PSF × fitted flux stamps for each source NOT the psf template stamp which stamp[4] element
+    weightstack : ndarray (N,S,S)
+        Weight (inverse noise) stamps.
+    imstack : ndarray (N,S,S)
+        Raw image data stamps.
+    flux : ndarray (N,)
+        Fitted source flux amplitudes.
+
+    Returns
+    -------
+    stats : OrderedDict
+        Dictionary of per-source measurements:
+        - dx, dy : position uncertainties
+        - dflux  : flux uncertainty
+        - qf     : quality factor (fraction of valid PSF footprint)
+        - rchi2  : reduced chi2 of fit
+        - fracflux : fraction of flux modeled
+        - fluxlbs/dfluxlbs : large-box summed flux and error
+        - fluxiso,xiso,yiso : isophotal flux and centroid
+        - fwhm   : effective PSF width
+        - spread_model/dspread_model : star/galaxy separator
+    """
+
+    # Residuals = (image data - model)
     residstack = impsfstack - psfstack
+
+    # Normalize PSF stamps so they integrate to 1
     norm = numpy.sum(psfstack, axis=(1, 2))
+
+    # print("psf norm", norm[:10])
+    # print("psfstack", psfstack[1][0])
+
     psfstack = psfstack / (norm + (norm == 0)).reshape(-1, 1, 1)
+
+    # Quality factor how “complete” the measurement is = fraction of the PSF footprint that overlaps with good/unmasked pixels.
     qf = numpy.sum(psfstack*(weightstack > 0), axis=(1, 2))
+
+    # Flux uncertainty = inverse sqrt(sum(PSF^2 * weight^2))
     fluxunc = numpy.sum(psfstack**2.*weightstack**2., axis=(1, 2))
     fluxunc = fluxunc + (fluxunc == 0)*1e-20
     fluxunc = (fluxunc**(-0.5)).astype('f4')
+
+    if numpy.any(fluxunc > 1e8):
+        print("compute_stats: huge fluxunc", fluxunc.max(), "min denom:", numpy.min(numpy.sum(psfstack**2.*weightstack**2., axis=(1,2))))
+
+    mask_empty = numpy.sum(weightstack > 0, axis=(1,2)) == 0
+    if numpy.any(mask_empty):
+        print("DEBUG: sources with empty weights:", numpy.nonzero(mask_empty)[0])
+
+    # Initialize arrays for positional uncertainties
     posunc = [numpy.zeros(len(qf), dtype='f4'),
               numpy.zeros(len(qf), dtype='f4')]
+
+    # Derivatives of the normalized PSF (for centroid uncertainty)
     psfderiv = numpy.gradient(-psfstack, axis=(1, 2))
     for i, p in enumerate(psfderiv):
+        # Position error sigma_x,sigma_y ∝ 1/sqrt(sum((dPSF * flux * weight)^2))
         dp = numpy.sum((p*weightstack*flux[:, None, None])**2., axis=(1, 2))
         dp = dp + (dp == 0)*1e-40
         dp = dp**(-0.5)
         posunc[i][:] = dp
+
+    # Reduced chi2 of the fit, weighted by PSF footprint
     rchi2 = numpy.sum(residstack**2.*weightstack**2.*psfstack,
                       axis=(1, 2)) / (qf + (qf == 0.)*1e-20).astype('f4')
-    fracfluxn = numpy.sum(impsfstack*(weightstack > 0)*psfstack,
-                          axis=(1, 2))
-    fracfluxd = numpy.sum(imstack*(weightstack > 0)*psfstack,
-                          axis=(1, 2))
+
+    # Flux fraction: how much of the flux is explained by the model. Best for point sources, high S/N.
+    fracfluxn = numpy.sum(impsfstack*(weightstack > 0)*psfstack, axis=(1, 2))
+    fracfluxd = numpy.sum(imstack*(weightstack > 0)*psfstack, axis=(1, 2))
     fracfluxd = fracfluxd + (fracfluxd == 0)*1e-20
     fracflux = (fracfluxn / fracfluxd).astype('f4')
-    fluxlbs, dfluxlbs = compute_lbs_flux(impsfstack, psfstack, weightstack,
-                                         flux/(norm+(norm == 0)))
-    fluxiso, xiso, yiso = compute_iso_fit(impsfstack, psfstack, weightstack,
-                                          flux/(norm+(norm == 0)), psfderiv)
-    fluxlbs = fluxlbs.astype('f4')
-    dfluxlbs = dfluxlbs.astype('f4')
+
+    # Alternative flux estimators
+    # - LBS flux: large box summation - big box aperture flux. 
+    # Robust sanity check (if PSF model is wrong, we notice a discrepancy).
+    fluxlbs, dfluxlbs = compute_lbs_flux(impsfstack, psfstack, weightstack, flux/(norm+(norm == 0)))
+    fluxlbs = fluxlbs.astype('f4'); dfluxlbs = dfluxlbs.astype('f4')
+
+    # - Isophotal flux/centroid using PSF derivatives. Flux within brightness contour.
+    # Useful for galaxies, extended emission.
+    fluxiso, xiso, yiso = compute_iso_fit(impsfstack, psfstack, weightstack, flux/(norm+(norm == 0)), psfderiv)
+
+    # Effective PSF FWHM for this source
     fwhm = psfmod.neff_fwhm(psfstack).astype('f4')
+
+    # Spread model (star/galaxy separator)
     spread, dspread = spread_model(impsfstack, psfstack, weightstack)
+
     return OrderedDict([('dx', posunc[0]), ('dy', posunc[1]),
                         ('dflux', fluxunc),
                         ('qf', qf), ('rchi2', rchi2), ('fracflux', fracflux),
@@ -1024,6 +1922,121 @@ def compute_stats(xs, ys, impsfstack, psfstack, weightstack, imstack, flux):
                         ('fwhm', fwhm), ('spread_model', spread),
                         ('dspread_model', dspread),
                         ('fluxiso', fluxiso), ('xiso', xiso), ('yiso', yiso)])
+
+
+def compute_stats_multiband(xs, ys, stamps_mb, flux_flat):
+    """
+    Multiband wrapper around single-band compute_stats.
+
+    Parameters
+    ----------
+    xs, ys : ndarray of length N
+        Source centroid offsets (subpixel positions).
+    stamps_mb : tuple of 5 arrays, each shaped (B, N, S, S)
+        (impsfstack, imstack, psfstack, weightstack, psf*flux) for all bands.
+    flux_flat : ndarray
+        Flattened flux vector from fit_once_multiband.
+        Layout is:
+          [f^(1)_1...f^(1)_N, f^(2)_1...f^(2)_N, ..., f^(B)_1...f^(B)_N,
+           (optional) dx,dy block,
+           (optional) sky params]
+
+    Returns
+    -------
+    stats : OrderedDict
+        Per-band fields (with suffix _b{b}) and joint fields:
+        - dx_joint, dy_joint : combined position uncertainties
+        - rchi2_joint        : combined reduced chi^2
+        - snr_joint          : joint SNR across bands
+    """
+    import numpy as np
+    from collections import OrderedDict
+
+    impsf_b, im_b, psf_b, w_b, _ = stamps_mb  # each (B, N, S, S)
+    B, N, _, _ = psf_b.shape
+
+    # detect if derivatives present
+    base_flux_len = B * N
+    has_deriv = len(flux_flat) >= base_flux_len + 2 * N
+
+    # --- slice fluxes only ---
+    flux_blocks = [flux_flat[b * N:(b + 1) * N] for b in range(B)]
+
+    dx_list, dy_list, qf_list, rchi2_list, dflux_list, flux_list = [], [], [], [], [], []
+    out = OrderedDict()
+
+    for b in range(B):
+        flux_b = flux_blocks[b]
+
+        # call single-band compute_stats
+        sb = compute_stats(xs, ys,
+                           impsf_b[b],     # impsfstack
+                           im_b[b],        # imstack (data)
+                           psf_b[b],       # psfstack (model)
+                           w_b[b],         # weightstack
+                           flux_b)         # just fluxes for this band
+
+        for k, v in sb.items():
+            out[f"{k}_b{b}"] = v.astype('f4')
+
+        # keep for joint metrics
+        dx_list.append(sb['dx'])
+        dy_list.append(sb['dy'])
+        qf_list.append(sb['qf'])
+        rchi2_list.append(sb['rchi2'])
+        dflux_list.append(sb['dflux'])
+        flux_list.append(flux_b)
+
+    # convert to arrays (B, N)
+    dx_arr = np.vstack(dx_list); dy_arr = np.vstack(dy_list)
+    qf_arr = np.vstack(qf_list); rchi2_arr = np.vstack(rchi2_list)
+    dflux_arr = np.vstack(dflux_list); flux_arr = np.vstack(flux_list)
+
+    # ---- Aggregate joint metrics ----
+
+    # 1) Joint reduced-chi^2:
+    #    Each band’s rchi2 = Σ(resid^2 * w^2 * psf) / qf
+    #    To combine, sum numerators and denominators across bands:
+    #    numerator_b = rchi2_b * qf_b
+    num_joint = np.sum(rchi2_arr * qf_arr, axis=0)
+    den_joint = np.sum(qf_arr, axis=0)
+    rchi2_joint = num_joint / (den_joint + (den_joint == 0)*1e-20)
+
+    # 2) Joint position uncertainties:
+    #    Single-band dx,dy are 1σ position errors.
+    #    For independent measurements, combine via inverse-variance:
+    #    1/σ_joint^2 = Σ (1/σ_b^2)
+    inv2_dx = np.sum(1.0 / (dx_arr**2 + 1e-20), axis=0)
+    inv2_dy = np.sum(1.0 / (dy_arr**2 + 1e-20), axis=0)
+    dx_joint = (1.0 / (inv2_dx + (inv2_dx == 0)*1e-20))**0.5
+    dy_joint = (1.0 / (inv2_dy + (inv2_dy == 0)*1e-20))**0.5
+
+    # 3) Joint SNR:
+    #    Per-band SNR = F / σ_F
+    #    Independent SNRs add in quadrature:
+    #    SNR_joint = sqrt( Σ SNR_b^2 )
+    snr_bands = flux_arr / (dflux_arr + 1e-20)
+    snr_joint = np.sqrt(np.sum(snr_bands**2, axis=0))
+
+    # NOTE:
+    # - dx_b{b}, dy_b{b}, dx_joint, dy_joint = *uncertainties* (not centroid shifts).
+    # - Actual centroid shifts (dx_fit, dy_fit) come from flux_flat derivative block,
+    #   but are not reported here to keep behavior consistent with single-band stats.
+
+    # ---- Add joint metrics to output ----
+    out['dx_joint'] = dx_joint.astype('f4')
+    out['dy_joint'] = dy_joint.astype('f4')
+    out['rchi2_joint'] = rchi2_joint.astype('f4')
+    out['snr_joint'] = snr_joint.astype('f4')
+    bad = np.where(dflux_arr[b] > 1e8)[0]
+    print("Band", b, "bad sources:", bad[:10])
+    print("flux_b[bad]", flux_blocks[b][bad][:10])
+    print("qf[bad]", sb['qf'][bad][:10])
+    print("weight sum[bad]", np.sum(stamps_mb[3][b][bad], axis=(1,2))[:10])
+
+    return out
+
+
 
 
 def spread_model(impsfstack, psfstack, weightstack):
