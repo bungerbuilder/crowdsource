@@ -5,7 +5,7 @@ import sys
 import time
 import pdb
 import argparse
-import numpy
+import numpy as np
 import crowdsource.psf as psfmod
 from astropy.io import fits
 from crowdsource import crowdsource_base
@@ -16,6 +16,7 @@ import crowdsource.unwise_primary as unwise_primary
 from astropy import wcs
 from collections import OrderedDict
 from pkg_resources import resource_filename
+
 
 
 extrabits = {'crowdsat': 2**25,
@@ -60,11 +61,11 @@ def wise_filename(basedir, coadd_id, band, _type, uncompressed=False,
 
 def read_blist(brightstars, raim, decim, hdr, maxsep):
     from astropy.coordinates.angle_utilities import angular_separation
-    sep = angular_separation(numpy.radians(brightstars['ra']),
-                             numpy.radians(brightstars['dec']),
-                             numpy.radians(raim),
-                             numpy.radians(decim))
-    sep = numpy.degrees(sep)
+    sep = angular_separation(np.radians(brightstars['ra']),
+                             np.radians(brightstars['dec']),
+                             np.radians(raim),
+                             np.radians(decim))
+    sep = np.degrees(sep)
     m = (sep < 3) & (brightstars['k_m'] < 5)
     brightstars = brightstars[m]
     wcs0 = wcs.WCS(hdr)
@@ -72,7 +73,7 @@ def read_blist(brightstars, raim, decim, hdr, maxsep):
     m = (xx > 0) & (xx < hdr['NAXIS1']) & (yy > 0) & (yy < hdr['NAXIS2'])
     xx, yy = xx[m], yy[m]
     mag = brightstars['k_m'][m]
-    if not numpy.any(m):
+    if not np.any(m):
         return None
     else:
         return [xx, yy, mag]
@@ -109,7 +110,7 @@ def massage_isig_and_dim(isig, im, flag, band, nm, nu, fac=None):
     from scipy.ndimage import morphology
     # dilate = morphology.iterate_structure(
     #     morphology.generate_binary_structure(2, 1), 3)
-    xx, yy = numpy.mgrid[-3:3+1, -3:3+1]
+    xx, yy = np.mgrid[-3:3+1, -3:3+1]
     dilate = xx**2+yy**2 <= 3**2
     msat = morphology.binary_dilation(msat, dilate)
     isig[msat] = 0
@@ -122,10 +123,10 @@ def massage_isig_and_dim(isig, im, flag, band, nm, nu, fac=None):
     flag[(flag & nodeblend_bits) != 0] |= crowdsource_base.nodeblend_maskbit
     flag[(flag & sharp_bits) != 0] |= crowdsource_base.sharp_maskbit
 
-    sigma = numpy.sqrt(1./(isig + (isig == 0))**2 + floor**2 +
-                       fac**2*numpy.clip(im, 0, numpy.inf))
-    sigma[msat] = numpy.inf
-    sigma[isig == 0] = numpy.inf
+    sigma = np.sqrt(1./(isig + (isig == 0))**2 + floor**2 +
+                       fac**2*np.clip(im, 0, np.inf))
+    sigma[msat] = np.inf
+    sigma[isig == 0] = np.inf
     return (1./sigma).astype('f4'), flag
 
 
@@ -137,15 +138,15 @@ def wise_psf_stamp(band, nosmooth=False):
     stampfn = resource_filename('unwise_psf',
                                 'data/psf_model_w'+str(band)+'.fits')
     stamp = fits.getdata(stampfn)
-    edges = numpy.concatenate([stamp[0, 1:-1], stamp[-1, 1:-1],
+    edges = np.concatenate([stamp[0, 1:-1], stamp[-1, 1:-1],
                                stamp[1:-1, 0], stamp[1:-1, -1]])
-    medval = numpy.median(edges[edges != 0]) / 2
+    medval = np.median(edges[edges != 0]) / 2
     stamp[stamp == 0] = medval
     stamp -= medval
     from scipy import signal
     stamp[stamp < 0] = 0.
     # suppress spurious warnings in signal.wiener
-    olderr = numpy.seterr(invalid='ignore', divide='ignore')
+    olderr = np.seterr(invalid='ignore', divide='ignore')
     # update to scipy.signal means that Wiener filter uses an FFT
     # to perform the various convolutions, which causes bad errors
     # here unless we cast to f8.  It's not that hard to do something
@@ -154,16 +155,16 @@ def wise_psf_stamp(band, nosmooth=False):
     # want to go further down that rabbit hole today.
     stamp = signal.wiener(stamp.astype('f8'),  11, psfnoise)
     stamp = stamp.astype('f4')
-    numpy.seterr(**olderr)
+    np.seterr(**olderr)
     # taper linearly over outer 60 pixels?
     stampszo2 = stamp.shape[0] // 2
-    xx, yy = numpy.mgrid[-stampszo2:stampszo2+1, -stampszo2:stampszo2+1]
-    edgedist = numpy.clip(stampszo2-numpy.abs(xx), 0,
-                          stampszo2-numpy.abs(yy))
-    stamp = stamp * numpy.clip(edgedist / 60., stamp < 10, 1)
+    xx, yy = np.mgrid[-stampszo2:stampszo2+1, -stampszo2:stampszo2+1]
+    edgedist = np.clip(stampszo2-np.abs(xx), 0,
+                          stampszo2-np.abs(yy))
+    stamp = stamp * np.clip(edgedist / 60., stamp < 10, 1)
     import psf
     stamp = psf.center_psf(stamp, censize=19)
-    stamp = stamp / numpy.sum(stamp)
+    stamp = stamp / np.sum(stamp)
     return stamp
 
 
@@ -189,13 +190,13 @@ def wise_psf_grid(band, coadd_id, basedir, uncompressed=False,
         coord = SkyCoord(ra=rr*u.deg, dec=dd*u.deg, frame='icrs')
         coord = coord.geocentrictrueecliptic
         lam, bet = coord.lon.deg, coord.lat.deg
-        dlam = 1.4/(numpy.abs(numpy.cos(numpy.radians(bet)))+1e-6)
-        ngrid = numpy.floor(numpy.clip(dlam / 1, 4, 16)).astype('i4')
-    x = numpy.linspace(0, 2047, ngrid)
-    y = numpy.linspace(0, 2047, ngrid)
+        dlam = 1.4/(np.abs(np.cos(np.radians(bet)))+1e-6)
+        ngrid = np.floor(np.clip(dlam / 1, 4, 16)).astype('i4')
+    x = np.linspace(0, 2047, ngrid)
+    y = np.linspace(0, 2047, ngrid)
     wcs0 = wcs.WCS(hdr)
     stamp = wise_psf_stamp(band).astype('f4')
-    stamps = numpy.zeros((len(x), len(y))+stamp.shape, dtype=stamp.dtype)
+    stamps = np.zeros((len(x), len(y))+stamp.shape, dtype=stamp.dtype)
     unwise_psf.rotate_using_convolution.cache = None  # clear cache
     for i in range(len(x)):
         for j in range(len(y)):
@@ -231,7 +232,7 @@ def read_wise(coadd_id, band, basedir, uncompressed=False,
                          drop_first_dir=drop_first_dir, epoch=epoch)
 
     im, hdr = fits.getdata(imagefn, header=True)
-    sqivar = numpy.sqrt(fits.getdata(ivarfn))
+    sqivar = np.sqrt(fits.getdata(ivarfn))
     flag = fits.getdata(flagfn)
     nm = fits.getdata(nmfn)
     nu = fits.getdata(nufn)
@@ -291,7 +292,7 @@ def collapse_unwise_bitmask(bitmask, band):
     result = 0*bitmask
 
     for i, feat in enumerate(bits.keys()):
-        result += (2**i)*(numpy.bitwise_and(bitmask, bits[feat]) != 0)
+        result += (2**i)*(np.bitwise_and(bitmask, bits[feat]) != 0)
 
     # int8 would be fine here, but astropy.io.fits seems to read this
     # as a boolean... so we waste the extra 8 bits.
@@ -323,11 +324,59 @@ def collapse_extraflags(bitmask, band):
     result = 0*bitmask
 
     for i, feat in enumerate(bits.keys()):
-        result += (2**i)*(numpy.bitwise_and(bitmask, bits[feat]) != 0)
+        result += (2**i)*(np.bitwise_and(bitmask, bits[feat]) != 0)
 
     # could fit in a byte, but astropy.io.fits reads these as booleans,
     # so we waste the byte...
     return result.astype('i2')
+
+def merge_per_band_fields(cat, bands):
+    """
+    Merge flux_bi -> flux[:,i] and remove per-band fields.
+    bands : list of actual WISE bands, e.g. [1,2]
+
+    Returns: New catalog array with merged fields.
+    """
+    import re
+
+    # ---- Convert WISE bands to 0-based internal indices ----
+    # Example: bands=[1,2] --> idx_bands=[0,1]
+    idx_bands = list(range(len(bands)))
+    pat = re.compile(r"^(.*)_b(\d+)$")
+
+    #detect per-band fields
+    mapping = {}; per_band_fields = set()
+    for name in cat.dtype.names:
+        m = pat.match(name)
+        if m:
+            base = m.group(1); band_idx = int(m.group(2))
+            per_band_fields.add(name)
+            mapping.setdefault(base, {})[band_idx] = name
+
+    #build new dtype (keep non-per-band)
+    new_dtype = []
+    for name in cat.dtype.names:
+        if name not in per_band_fields: new_dtype.append((name, cat[name].dtype))
+
+    #add merged fields
+    B = len(idx_bands)
+    for base, band_dict in mapping.items():
+        # Only merge if all internal indices appear
+        if all(i in band_dict for i in idx_bands): new_dtype.append((base, "f4", (B,)))
+    out = np.zeros(len(cat), dtype=new_dtype)
+
+    # Copy non-per-band fields
+    for name in out.dtype.names:
+        if name in cat.dtype.names: out[name] = cat[name]
+
+    # fill merged arrays
+    for base, band_dict in mapping.items():
+        if not all(i in band_dict for i in idx_bands): continue
+        merged = np.vstack([cat[band_dict[i]].astype("f4") for i in idx_bands]).T
+        out[base] = merged
+
+    return out
+
 
 
 if __name__ == "__main__":
@@ -382,30 +431,23 @@ if __name__ == "__main__":
 
     ims, sqivars, psfs, flags, hdrs, blists = [], [], [], [], [], []
     for band in args.bands:
-        im, sqivar, flag, hdr = read_wise(coadd_id, band, basedir,
-                                          uncompressed=args.uncompressed,
-                                          epoch=args.epoch)
+        im, sqivar, flag, hdr = read_wise(coadd_id, band, basedir, uncompressed=args.uncompressed, epoch=args.epoch)
     
-        if len(args.startsky) > 0:
-            startsky = fits.getdata(args.startsky, 'SKY')
-        else:
-            startsky = numpy.nan
+        if len(args.startsky) > 0: startsky = fits.getdata(args.startsky, 'SKY')
+        else: startsky = np.nan
     
-        flag_orig = fits.getdata(wise_filename(basedir, coadd_id, band, 'msk',
-                                               uncompressed=args.uncompressed,
-                                               epoch=args.epoch))
+        flag_orig = fits.getdata(wise_filename(basedir, coadd_id, band, 'msk', uncompressed=args.uncompressed, epoch=args.epoch))
     
         if args.masknebulosity:
             import nebulosity_mask
-            nebfn = os.path.join(os.environ['WISE_DIR'], 'dat', 'nebnet',
-                                 'weights1', '1st_try')
+            nebfn = os.path.join(os.environ['WISE_DIR'], 'dat', 'nebnet', 'weights1', '1st_try')
             nebmod = nebulosity_mask.load_model(nebfn)
             nebmask = nebulosity_mask.gen_mask_wise(nebmod, im) == 2
-            if numpy.any(nebmask):
+            if np.any(nebmask):
                 # mark those pixels as bad in the flag map
                 flag |= nebmask * extrabits['nebulosity']
                 flag |= nebmask * crowdsource_base.sharp_maskbit
-                print('Masking nebulosity, %5.2f' % ( numpy.sum(nebmask)/1./numpy.sum(numpy.isfinite(nebmask))))
+                print('Masking nebulosity, %5.2f' % (np.sum(nebmask)/1./np.sum(np.isfinite(nebmask))))
     
         psf = wise_psf_grid(band, coadd_id, basedir, epoch=args.epoch)
 
@@ -424,8 +466,7 @@ if __name__ == "__main__":
     
         if len(args.brightcat) > 0:
             brightstars = fits.getdata(args.brightcat)
-            blist = brightlist(brightstars, coadd_id, band, basedir,
-                               uncompressed=args.uncompressed, epoch=args.epoch)
+            blist = brightlist(brightstars, coadd_id, band, basedir, uncompressed=args.uncompressed, epoch=args.epoch)
         else:
             print(f'No bright star catalog in band{band}, not marking bright stars.')
             blist = None
@@ -435,7 +476,7 @@ if __name__ == "__main__":
     # print("Input image shapes:", [im.shape for im in ims])
     # print("Weight shapes:", [sq.shape for sq in sqivars])
     # print("Flag shapes:", [fl.shape for fl in flags])
-    # print("PSF shapes:", [psf.stamp.shape for psf in numpy.array(psfs)])
+    # print("PSF shapes:", [psf.stamp.shape for psf in np.array(psfs)])
 
     if args.verbose:
         logfn = os.path.join(outdir, 'log', f'{coadd_id}.{bands_str}.log')
@@ -446,43 +487,38 @@ if __name__ == "__main__":
         print('Band weights:', args.bandweights)
         sys.stdout.flush()
 
-    if len(args.bands) == 1:
-        im, sqivar, psf, flag, blist = ims[0], sqivars[0], psfs[0], flags[0], blists[0]
-        if len(args.forcecat) == 0:
-            res = crowdsource_base.fit_im(
-                im, psf, weight=sqivar, dq=flag,
-                refit_psf=args.refit_psf, verbose=args.verbose,
-                ntilex=4, ntiley=4, derivcentroids=True,
-                maxstars=30000*16, fewstars=50*16,
-                blist=blist, threshold=args.threshold,
-                psfvalsharpcutfac=0.5, psfsharpsat=0.8)
-        else:
-            forcecat = fits.getdata(args.forcecat, 1)
-            x, y = forcecat['x'], forcecat['y']
-            res = crowdsource_base.fit_im_force(
-                im, x, y, psf, weight=sqivar, dq=flag,
-                refit_psf=args.refit_psf, blist=blist,
-                refit_sky=(not args.noskyfit), startsky=startsky,
-                psfderiv=False, psfvalsharpcutfac=0.5, psfsharpsat=0.8)
-    else:
-        flag_combined = numpy.bitwise_or.reduce(numpy.stack(flags, axis=0))
-        res = crowdsource_base.fit_im_multiband(
-            ims, psfs, weights=sqivars, dq=flag_combined, band_weights=args.bandweights,
+    flag_combined = np.bitwise_or.reduce(np.stack(flags, axis=0))
+    if len(args.forcecat) == 0:
+        res = crowdsource_base.fit_im(
+            ims, psfs, weights=sqivars, dq=flag_combined,
+            band_weights=args.bandweights,
             refit_psf=args.refit_psf, verbose=args.verbose,
             ntilex=4, ntiley=4, derivcentroids=True,
             maxstars=30000*16, fewstars=50*16,
             threshold=args.threshold,
-            psfvalsharpcutfac=0.5, psfsharpsat=0.8)
+            psfvalsharpcutfac=0.5, psfsharpsat=0.8
+        )
 
-        
+    else:
+        # This block won't work for multiband fits
+        forcecat = fits.getdata(args.forcecat, 1)
+        x, y = forcecat['x'], forcecat['y']
+        res = crowdsource_base.fit_im_force(
+            im, x, y, psf, weight=sqivar, dq=flag, refit_psf=args.refit_psf,
+            blist=blist, refit_sky=(not args.noskyfit),
+            startsky=startsky, psfderiv=False, psfvalsharpcutfac=0.5,
+            psfsharpsat=0.8)
+
     cat, model, sky, psf = res
-    print('Finishing %s, band %s; %d sec elapsed.' %(coadd_id, args.bands, time.time()-t0))
+
+    if args.verbose:
+        print(f'Finishing {coadd_id}, bands {args.bands}; elapsed {time.time() - t0:.1f}sec.')
 
     x = cat['x']; y = cat['y']
 
     if len(args.bands) == 1:
         # --- Single-band case ---
-        hdr = hdrs[0]  # just the single band header
+        hdr = hdrs[0] 
         hdr['BAND'] = args.bands[0]
     
         band_val = args.bands[0]
@@ -493,40 +529,46 @@ if __name__ == "__main__":
         hdr = hdrs[0].copy()
         hdr['BANDS'] = ','.join(str(b) for b in args.bands)
     
-        id_prefix = f"{coadd_id}w{''.join(str(b) for b in args.bands)}"
+        # id_prefix = f"{coadd_id}w{''.join(str(b) for b in args.bands)}"   #Band format : w123...
+        id_prefix = f"{coadd_id}{''.join(f'w{b}' for b in args.bands)}"    #Band format : w1w2w3...
+
     
     # ---- Now compute RA/Dec using hdr ----
     wcs0 = wcs.WCS(hdr)
     ra, dec = wcs0.all_pix2world(y, x, 0)
-    coadd_ids = numpy.full(len(ra), coadd_id, dtype='a8')
+    coadd_ids = np.full(len(ra), coadd_id, dtype='a8')
     
     # ---- Build bands_col ----
-    if len(args.bands) == 1: bands_col = numpy.full(len(ra), band_val, dtype='i4')
-    else: bands_col = numpy.full(len(ra), -1, dtype='i4')  # -1 = joint fit
+    if len(args.bands) == 1: bands_col = np.full(len(ra), band_val, dtype='i4')
+    else: bands_col = np.full(len(ra), -1, dtype='i4')  # -1 = joint fit
 
     if len(args.release) == 0: ids = [f"{id_prefix}o{num:07d}" for num in range(len(ra))]
     else: ids = [f"{id_prefix}o{num:07d}r{args.release}" for num in range(len(ra))]
 
 
-    nm_all, flags_unwise_all, flags_info_all = [], [], []
-    for band in args.bands:
+    nms_all, flags_unwise_all, flags_info_all = [], [], []
+    for i, band in enumerate(args.bands):
         # nm per band
         nmfn = wise_filename(basedir, coadd_id, band, 'n-m', uncompressed=args.uncompressed, epoch=args.epoch)
         nmim = fits.getdata(nmfn)
-        nm_all.append(crowdsource_base.extract_im(cat['x'], cat['y'], nmim))
-    
+        nms_all.append(crowdsource_base.extract_im(cat['x'], cat['y'], nmim))
+
+        flag_orig = fits.getdata(wise_filename(basedir, coadd_id, band, 'msk',
+                                               uncompressed=args.uncompressed,
+                                               epoch=args.epoch))
+        
         # unwise flags per band
         fu = crowdsource_base.extract_im(cat['x'], cat['y'], collapse_unwise_bitmask(flag_orig, band))
         flags_unwise_all.append(fu)
     
         # info flags per band
-        fi = crowdsource_base.extract_im(cat['x'], cat['y'], collapse_extraflags(flag, band))
+        fi = crowdsource_base.extract_im(cat['x'], cat['y'], collapse_extraflags(flags[i], band))
         flags_info_all.append(fi)
     
     # Stack into (nbands, nsource) arrays  
-    nm_all = numpy.array(nm_all)                  # shape (nbands, nsrc)
-    flags_unwise_all = numpy.array(flags_unwise_all)
-    flags_info_all   = numpy.array(flags_info_all)
+    nms_all = np.array(nms_all)                  
+    flags_unwise_all = np.array(flags_unwise_all)
+    flags_info_all   = np.array(flags_info_all)
     
     # cast to i2; astropy.io.fits seems to fail for bools?
     primary = unwise_primary.is_primary(coadd_id, ra, dec).astype('i2')
@@ -541,15 +583,26 @@ if __name__ == "__main__":
         usemask=False
     )
     # append per-band info as separate columns
+    from numpy.lib import recfunctions as rfn
+    seen = set()
     for ib, band in enumerate(args.bands):
-        cat = rfn.append_fields(cat, [f'nm_b{band}'], [nm_all[:, ib]], usemask=False)
-        cat = rfn.append_fields(cat, [f'flags_unwise_b{band}'], [flags_unwise_all[:, ib]], usemask=False)
-        cat = rfn.append_fields(cat, [f'flags_info_b{band}'], [flags_info_all[:, ib]], usemask=False)
+        if band in seen:      # skip duplicate bands (e.g., W1 in W1+W1)
+            continue
+        seen.add(band)
+    
+        cat = rfn.append_fields(cat, [f'nm_b{band}'],           [nms_all[ib, :]],         usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_unwise_b{band}'], [flags_unwise_all[ib, :]], usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_info_b{band}'],   [flags_info_all[ib, :]],  usemask=False)
 
+    print(cat.dtype.names)
+    #Merge the individual bands to have the output with the structure as objcat
+    cat_out = merge_per_band_fields(cat, args.bands)
+    print(cat_out.dtype.names)
+    
 
     hdr['EXTNAME'] = 'PRIMARY'
     fits.writeto(outfn, None, hdr, overwrite=True)
-    fits.append(outfn, cat)
+    fits.append(outfn, cat_out)
     
     if modelfn is not None:
         hdulist = fits.open(modelfn, mode='append')
@@ -559,9 +612,9 @@ if __name__ == "__main__":
                       'quantize_method': 2, 'quantize_level': -0.5,
                       'tile_shape': mshape}
         hdr['EXTNAME'] = 'model'
-        hdulist.append(fits.CompImageHDU(numpy.stack(model, axis=0), hdr, **compkw))
+        hdulist.append(fits.CompImageHDU(np.stack(model, axis=0), hdr, **compkw))
         hdr['EXTNAME'] = 'sky'
-        hdulist.append(fits.CompImageHDU(numpy.stack(sky, axis=0), hdr, **compkw))
+        hdulist.append(fits.CompImageHDU(np.stack(sky, axis=0), hdr, **compkw))
         hdulist.close(closed=True)
 
     if infoimfn is not None:
@@ -572,7 +625,7 @@ if __name__ == "__main__":
             band = args.bands[0]
             psffluxivar = ivarmap(sqivar, psf(1024, 1024, stampsz=59)).astype('f4')
             psfstamp    = psf(1024, 1024, stampsz=325)
-            flags_infoim = collapse_extraflags(flag, band)
+            flags_infoim = collapse_extraflags(flags[0], band)
     
             compkw = {'compression_type': 'GZIP_1',
                       'quantize_method': 2,
@@ -599,9 +652,9 @@ if __name__ == "__main__":
                 flags_infoim_all.append(collapse_extraflags(flags[ib], band))
                 psfstamp_all.append(psf[ib](1024,1024,stampsz=325))
     
-            psffluxivar_all = numpy.array(psffluxivar_all)   # shape (nband, ny, nx)
-            flags_infoim_all = numpy.array(flags_infoim_all) # shape (nband, ny, nx)
-            psfstamp_all     = numpy.array(psfstamp_all)     # shape (nband, ny_psf, nx_psf)
+            psffluxivar_all = np.array(psffluxivar_all)   # shape (nband, ny, nx)
+            flags_infoim_all = np.array(flags_infoim_all) # shape (nband, ny, nx)
+            psfstamp_all     = np.array(psfstamp_all)     # shape (nband, ny_psf, nx_psf)
     
             compkw = {'compression_type': 'GZIP_1',
                       'quantize_method': 2,
