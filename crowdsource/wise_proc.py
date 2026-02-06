@@ -18,7 +18,6 @@ from collections import OrderedDict
 from pkg_resources import resource_filename
 
 
-
 extrabits = {'crowdsat': 2**25,
              'nebulosity': 2**26,
              'w1brightoffedge': 2**7,
@@ -399,13 +398,14 @@ if __name__ == "__main__":
     parser.add_argument('--uncompressed', '-u', default=False, action='store_true')
     parser.add_argument('--brightcat', '-b', default=os.environ.get('TMASS_BRIGHT', ''), type=str)
     parser.add_argument('--masknebulosity', '-n', action='store_true')
-    parser.add_argument('--forcecat', type=str, default='')
     parser.add_argument('--startsky', type=str, default='')
     parser.add_argument('--startpsf', type=str, default='')
     parser.add_argument('--noskyfit', default=False, action='store_true')
     parser.add_argument('--threshold', default=5, type=float)
     parser.add_argument('--epoch', type=int, default=-1)
     parser.add_argument('--release', type=str, default='')
+    parser.add_argument('--save_snapshot', default=False, action='store_true')
+    
 
     args = parser.parse_args()
 
@@ -488,28 +488,24 @@ if __name__ == "__main__":
         sys.stdout.flush()
 
     flag_combined = np.bitwise_or.reduce(np.stack(flags, axis=0))
-    if len(args.forcecat) == 0:
-        res = crowdsource_base.fit_im(
-            ims, psfs, weights=sqivars, dq=flag_combined,
-            band_weights=args.bandweights,
-            refit_psf=args.refit_psf, verbose=args.verbose,
-            ntilex=4, ntiley=4, derivcentroids=True,
-            maxstars=30000*16, fewstars=50*16,
-            threshold=args.threshold,
-            psfvalsharpcutfac=0.5, psfsharpsat=0.8
-        )
+    # if len(args.forcecat) == 0:
+    res = crowdsource_base.fit_im(
+        ims, psfs, weights=sqivars, dq=flag_combined,
+        band_weights=args.bandweights,
+        refit_psf=args.refit_psf, verbose=args.verbose,
+        ntilex=4, ntiley=4, maxstars=30000*16, fewstars=50*16,
+        threshold=args.threshold,
+        psfvalsharpcutfac=0.5, psfsharpsat=0.8
+    )
 
-    else:
-        # This block won't work for multiband fits
-        forcecat = fits.getdata(args.forcecat, 1)
-        x, y = forcecat['x'], forcecat['y']
-        res = crowdsource_base.fit_im_force(
-            im, x, y, psf, weight=sqivar, dq=flag, refit_psf=args.refit_psf,
-            blist=blist, refit_sky=(not args.noskyfit),
-            startsky=startsky, psfderiv=False, psfvalsharpcutfac=0.5,
-            psfsharpsat=0.8)
+    cat, model, sky, psf, snapshots = res
 
-    cat, model, sky, psf = res
+    if args.save_snapshot:
+        snapfn = os.path.join(outdir, "snapshot", f"{coadd_id}.{bands_str}{bw_str}.snapshots.npz")
+        os.makedirs(os.path.join(outdir, "snapshot"), exist_ok=True)    
+        snapshots_obj = np.array(snapshots, dtype=object)  
+        np.savez_compressed(snapfn, snapshots=snapshots_obj)
+        print("Wrote snapshots to:", snapfn)
 
     if args.verbose:
         print(f'Finishing {coadd_id}, bands {args.bands}; elapsed {time.time() - t0:.1f}sec.')
@@ -517,18 +513,14 @@ if __name__ == "__main__":
     x = cat['x']; y = cat['y']
 
     if len(args.bands) == 1:
-        # --- Single-band case ---
         hdr = hdrs[0] 
         hdr['BAND'] = args.bands[0]
-    
         band_val = args.bands[0]
         id_prefix = f"{coadd_id}w{band_val}"
     
     else:
-        # --- Multiband case ---
         hdr = hdrs[0].copy()
         hdr['BANDS'] = ','.join(str(b) for b in args.bands)
-    
         # id_prefix = f"{coadd_id}w{''.join(str(b) for b in args.bands)}"   #Band format : w123...
         id_prefix = f"{coadd_id}{''.join(f'w{b}' for b in args.bands)}"    #Band format : w1w2w3...
 
@@ -590,9 +582,9 @@ if __name__ == "__main__":
             continue
         seen.add(band)
     
-        cat = rfn.append_fields(cat, [f'nm_b{band}'],           [nms_all[ib, :]],         usemask=False)
-        cat = rfn.append_fields(cat, [f'flags_unwise_b{band}'], [flags_unwise_all[ib, :]], usemask=False)
-        cat = rfn.append_fields(cat, [f'flags_info_b{band}'],   [flags_info_all[ib, :]],  usemask=False)
+        cat = rfn.append_fields(cat, [f'nm_b{ib}'],           [nms_all[ib, :]],         usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_unwise_b{ib}'], [flags_unwise_all[ib, :]], usemask=False)
+        cat = rfn.append_fields(cat, [f'flags_info_b{ib}'],   [flags_info_all[ib, :]],  usemask=False)
 
     print(cat.dtype.names)
     #Merge the individual bands to have the output with the structure as objcat
@@ -603,73 +595,83 @@ if __name__ == "__main__":
     hdr['EXTNAME'] = 'PRIMARY'
     fits.writeto(outfn, None, hdr, overwrite=True)
     fits.append(outfn, cat_out)
-    
+
+
     if modelfn is not None:
-        hdulist = fits.open(modelfn, mode='append')
-        if len(model)==2: mshape= model[0].shape  #multiband
-        else: mshape = model.shape  #single band
-        compkw = {'compression_type': 'GZIP_1',
-                      'quantize_method': 2, 'quantize_level': -0.5,
-                      'tile_shape': mshape}
-        hdr['EXTNAME'] = 'model'
-        hdulist.append(fits.CompImageHDU(np.stack(model, axis=0), hdr, **compkw))
-        hdr['EXTNAME'] = 'sky'
-        hdulist.append(fits.CompImageHDU(np.stack(sky, axis=0), hdr, **compkw))
-        hdulist.close(closed=True)
+        fits.writeto(modelfn, None, hdr, overwrite=True)
+        with fits.open(modelfn, mode='append', memmap=False) as hdulist:
+            if isinstance(model, (list, tuple)):
+                model_arr = np.stack(model, axis=0)
+                sky_arr   = np.stack(sky, axis=0)
+                tile_shape = model[0].shape
+            else:
+                model_arr = model
+                sky_arr   = sky
+                tile_shape = model.shape
+    
+            compkw = dict(compression_type='GZIP_1',
+                          quantize_method=2, quantize_level=-0.5,
+                          tile_shape=tile_shape)
+    
+            h = hdr.copy(); h['EXTNAME'] = 'model'
+            hdulist.append(fits.CompImageHDU(model_arr.astype('f4'), header=h, **compkw))
+    
+            h = hdr.copy(); h['EXTNAME'] = 'sky'
+            hdulist.append(fits.CompImageHDU(sky_arr.astype('f4'), header=h, **compkw))
+
 
     if infoimfn is not None:
-        hdulist = fits.open(infoimfn, mode='append')
+        fits.writeto(infoimfn, None, hdr, overwrite=True)
     
-        if len(args.bands) == 1:
-            # --- single-band (old behavior) ---
-            band = args.bands[0]
-            psffluxivar = ivarmap(sqivar, psf(1024, 1024, stampsz=59)).astype('f4')
-            psfstamp    = psf(1024, 1024, stampsz=325)
-            flags_infoim = collapse_extraflags(flags[0], band)
+        with fits.open(infoimfn, mode="append", memmap=False) as hdulist:
     
-            compkw = {'compression_type': 'GZIP_1',
-                      'quantize_method': 2,
-                      'tile_shape': psffluxivar.shape}
-            hdr['EXTNAME'] = 'psffluxivar'
-            hdulist.append(fits.CompImageHDU(psffluxivar, hdr, **compkw))
-    
-            compkw = {'compression_type': 'GZIP_1',
-                      'tile_shape': flags_infoim.shape}
-            # must recast flags_infoim as a u1; unsigned isn't supported
-            # in tables, but signed int8 isn't supported in CompImageHDU.
-            # ugh.
-            hdr['EXTNAME'] = 'infoflags'
-            hdulist.append(fits.CompImageHDU(flags_infoim.astype('u1'), hdr, **compkw))
-    
-            hdr['EXTNAME'] = 'psf'
-            hdulist.append(fits.ImageHDU(psfstamp, None))
-    
-        else:
-            # --- multiband (stacked) ---
             psffluxivar_all, flags_infoim_all, psfstamp_all = [], [], []
+    
             for ib, band in enumerate(args.bands):
-                psffluxivar_all.append(ivarmap(sqivars[ib], psf[ib](1024,1024,stampsz=59)).astype('f4'))
-                flags_infoim_all.append(collapse_extraflags(flags[ib], band))
-                psfstamp_all.append(psf[ib](1024,1024,stampsz=325))
+                psf_obj = psfs[ib]          # <-- ALWAYS use callable PSF object
+                sqivar  = sqivars[ib]
+                flagmap = flags[ib]
     
-            psffluxivar_all = np.array(psffluxivar_all)   # shape (nband, ny, nx)
-            flags_infoim_all = np.array(flags_infoim_all) # shape (nband, ny, nx)
-            psfstamp_all     = np.array(psfstamp_all)     # shape (nband, ny_psf, nx_psf)
+                psffluxivar_all.append(
+                    ivarmap(sqivar, psf_obj(1024, 1024, stampsz=59)).astype("f4")
+                )
+                flags_infoim_all.append(
+                    collapse_extraflags(flagmap, band).astype("u1")
+                )
+                psfstamp_all.append(
+                    psf_obj(1024, 1024, stampsz=325)
+                )
     
-            compkw = {'compression_type': 'GZIP_1',
-                      'quantize_method': 2,
-                      'tile_shape': psffluxivar_all.shape[-2:]}
-            hdr['EXTNAME'] = 'psffluxivar'
-            hdulist.append(fits.CompImageHDU(psffluxivar_all.astype('f4'), hdr, **compkw))
+            psffluxivar_all = np.asarray(psffluxivar_all)   # (B, ny, nx)
+            flags_infoim_all = np.asarray(flags_infoim_all) # (B, ny, nx)
+            psfstamp_all     = np.asarray(psfstamp_all)     # (B, nypsf, nxpsf)
     
-            compkw = {'compression_type': 'GZIP_1',
-                      'tile_shape': flags_infoim_all.shape[-2:]}
-            hdr['EXTNAME'] = 'infoflags'
-            hdulist.append(fits.CompImageHDU(flags_infoim_all.astype('u1'), hdr, **compkw))
+            # If single-band, write 2D images (not stacked) to match old behavior
+            if len(args.bands) == 1:
+                psffluxivar_to_write = psffluxivar_all[0]
+                flags_to_write       = flags_infoim_all[0]
+                psf_to_write         = psfstamp_all[0]
+                tile_shape = psffluxivar_to_write.shape
+            else:
+                psffluxivar_to_write = psffluxivar_all
+                flags_to_write       = flags_infoim_all
+                psf_to_write         = psfstamp_all
+                tile_shape = psffluxivar_to_write.shape[-2:]
     
-            hdr['EXTNAME'] = 'psf'
-            hdulist.append(fits.ImageHDU(psfstamp_all, None))
+            compkw = dict(compression_type="GZIP_1",
+                          quantize_method=2,
+                          tile_shape=tile_shape)
     
+            h = hdr.copy(); h["EXTNAME"] = "psffluxivar"
+            hdulist.append(fits.CompImageHDU(psffluxivar_to_write.astype("f4"), header=h, **compkw))
+    
+            h = hdr.copy(); h["EXTNAME"] = "infoflags"
+            hdulist.append(fits.CompImageHDU(flags_to_write.astype("u1"), header=h,
+                                             compression_type="GZIP_1", tile_shape=tile_shape))
+    
+            h = hdr.copy(); h["EXTNAME"] = "psf"
+            hdulist.append(fits.ImageHDU(psf_to_write, header=h))
+
         hdulist.close(closed=True)
 
 
