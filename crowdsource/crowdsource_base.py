@@ -414,7 +414,8 @@ def build_sparse_matrix(images_pad, weights_pad, psfs, x, y,
 
     # parameter count
     ncol = B * N                       # fluxes
-    if psfderiv: ncol += 2 * N                  # shared dx, dy per source
+    if psfderiv:
+        ncol += 2 * N                  # shared dx, dy per source
     ncol += B * nskypar                # sky terms
 
     #Total number of non-zero entries in the sparse matrix 'A'. Sky parameters take nskypar non-zero entries to be precise, but this way is just easier. 
