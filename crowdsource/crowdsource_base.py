@@ -596,7 +596,10 @@ def fit_once(ims, x, y, psfs, weights=None, psfderiv=False, nskyx=0, nskyy=0, gu
     """
 
     # Detect single-band or multiband case
-    if np.array(ims).ndim == 2: ims = [ims]; psfs = [psfs]; weights = [weights]
+    if np.array(ims).ndim == 2:
+        ims = [ims]
+        psfs = [psfs]
+        weights = [weights]
     B = len(ims)
 
     # common stamp size & padding
