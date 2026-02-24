@@ -626,7 +626,8 @@ def fit_once(ims, x, y, psfs, weights=None, psfderiv=False, nskyx=0, nskyy=0, gu
         ncol = B * N + (2 * N if psfderiv else 0) + B * nskypar
         guessvec = np.zeros(ncol, dtype='f4')
         for b in range(B):
-            start = b * N; end = (b + 1) * N
+            start = b * N
+            end = (b + 1) * N
             guessvec[start:end] = guess[start:end]  # Fill only the flux slots
     
         # sky guesses
