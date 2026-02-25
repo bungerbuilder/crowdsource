@@ -1477,8 +1477,8 @@ def compute_stats(xs, ys, stamps, flux_flat):
         fluxlbs, dfluxlbs = compute_lbs_flux(impsf_b, psf_b, w_b, flux_b / (norm + (norm == 0)))
         fluxlbs, dfluxlbs = fluxlbs.astype('f4'), dfluxlbs.astype('f4')
 
-        # - Isophotal flux/centroid using PSF derivatives. Flux within brightness contour.
-        # Useful for galaxies, extended emission.
+        # "isolated" flux; fit flux & centroid as if the star were a single star, based
+        # on imaged where neighbors have been subtracted from best simultaneous fit.
         fluxiso, xiso, yiso = compute_iso_fit(impsf_b, psf_b, w_b, flux_b / (norm + (norm == 0)), psfderiv)
 
         # Effective PSF FWHM for this source
