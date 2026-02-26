@@ -4,8 +4,8 @@ import os
 import sys
 import pdb
 import argparse
-import numpy
 import numpy as np
+from numpy.lib import recfunctions as rfn
 import crowdsource.psf as psfmod
 from astropy.io import fits
 from astropy import wcs
@@ -62,7 +62,7 @@ def read_data(imfn, ivarfn, dqfn, extname, badpixmask=None,
     from distutils.version import LooseVersion
     if LooseVersion(imh['PLVER']) < LooseVersion('V3.5'):
         imdedo = imded
-        imded = numpy.zeros_like(imded)
+        imded = np.zeros_like(imded)
         imded[(imdedo & 2**7) != 0] = 7
         imded[(imdedo & 2**4) != 0] = 5
         imded[(imdedo & 2**6) != 0] = 4
@@ -74,7 +74,7 @@ def read_data(imfn, ivarfn, dqfn, extname, badpixmask=None,
     imded = 2**imded
     # flag 7 does not seem to indicate problems with the pixels.
     mzerowt = (((imded & ~(np.uint32(2**0 | 2**7))) != 0) |
-               (imdew < wcutoff) | ~numpy.isfinite(imdew))
+               (imdew < wcutoff) | ~np.isfinite(imdew))
     if badpixmask is None:
         badpixmask = os.path.join(os.environ['DECAM_DIR'], 'data',
                                   'badpixmasksefs_comp.fits')
@@ -87,7 +87,7 @@ def read_data(imfn, ivarfn, dqfn, extname, badpixmask=None,
     imded |= ((badmask != 0) * np.uint32(extrabits['badpix']))
     mzerowt = mzerowt | (badmask != 0)
     imdew[mzerowt] = 0.
-    imdew[:] = numpy.sqrt(imdew)
+    imdew[:] = np.sqrt(imdew)
     if corrects7 and (extname[:2] == 'S7'):
         imdei = correct_sky_offset(imdei, weight=imdew)
         half = imded.shape[1] // 2
@@ -100,7 +100,7 @@ def read_data(imfn, ivarfn, dqfn, extname, badpixmask=None,
                 leda = galaxy_mask.read_leda_decaps()
                 read_data.leda = leda
             gmsk = galaxy_mask.galaxy_mask(hdr, leda)
-            if numpy.any(gmsk):
+            if np.any(gmsk):
                 imded |= (gmsk * np.uint32(extrabits['galaxy']))
                 imded |= (gmsk * np.uint32(crowdsource_base.nodeblend_maskbit))
         else:
@@ -122,13 +122,13 @@ def read_data(imfn, ivarfn, dqfn, extname, badpixmask=None,
             nebmask, nebprob = nebulosity_mask.gen_prob(
                 nebmod, imdei, return_prob=True)
 
-        if numpy.any(nebmask):
+        if np.any(nebmask):
             imded |= (nebmask * extrabits['diffuse'])
             imded |= (nebmask * (crowdsource_base.nodeblend_maskbit |
                                  crowdsource_base.sharp_maskbit))
             if verbose:
                 print('Masking nebulosity fraction, %5.2f' % (
-                    numpy.sum(nebmask)/1./numpy.sum(numpy.isfinite(nebmask))))
+                    np.sum(nebmask)/1./np.sum(np.isfinite(nebmask))))
     else:
         nebprob = None
 
@@ -163,10 +163,10 @@ def process_one_ccd(name, bigdict):
         wcutoff=wcutoff, contmask=contmask, maskgal=maskgal,
         verbose=verbose)
     hdr = fits.getheader(imfn, extname=name)
-    fwhm = hdr.get('FWHM', numpy.median(fwhms))
+    fwhm = hdr.get('FWHM', np.median(fwhms))
     if fwhm <= 0.:
         fwhm = 4.
-    fwhmmn, fwhmsd = numpy.mean(fwhms), numpy.std(fwhms)
+    fwhmmn, fwhmsd = np.mean(fwhms), np.std(fwhms)
     if fwhmsd > 0.4:
         fwhm = fwhmmn
     psf = decam_psf(filt[0], fwhm, pixsz=pixsz)
@@ -175,22 +175,22 @@ def process_one_ccd(name, bigdict):
     if brightstars is not None:
         raccdcen, decccdcen = wcs0.all_pix2world(
             im.shape[1]//2, im.shape[0]//2, 0)
-        sep = angular_separation(numpy.radians(brightstars['ra']),
-                                 numpy.radians(brightstars['dec']),
-                                 numpy.radians(raccdcen),
-                                 numpy.radians(decccdcen))
-        sep = numpy.degrees(sep)
+        sep = angular_separation(np.radians(brightstars['ra']),
+                                 np.radians(brightstars['dec']),
+                                 np.radians(raccdcen),
+                                 np.radians(decccdcen))
+        sep = np.degrees(sep)
         m = sep < 0.2
         # CCD is 4094 pix wide => everything is at most 0.15 deg
         # from center
-        if numpy.any(m):
+        if np.any(m):
             yb, xb = wcs0.all_world2pix(brightstars['ra'][m],
                                         brightstars['dec'][m], 0)
             vmag = brightstars['vtmag'][m]
             # WCS module and I order x and y differently...
             m = ((xb > 0) & (xb < im.shape[0]) &
                  (yb > 0) & (yb < im.shape[1]))
-            if numpy.any(m):
+            if np.any(m):
                 xb, yb = xb[m], yb[m]
                 vmag = vmag[m]
                 blist = [xb, yb, vmag]
@@ -205,33 +205,45 @@ def process_one_ccd(name, bigdict):
 
     # the actual fit (which has a nested iterative fit)
     res = crowdsource_base.fit_im(
-        im, psf, ntilex=4, ntiley=2, weight=wt, dq=dq, psfderiv=True,
+        im, psf, weights=wt, dq=dq, psfderiv=True, ntilex=4, ntiley=2,
         refit_psf=True, verbose=verbose, blist=blist, maxstars=320000,
         ccd=name, plot=plot, miniter=miniter, maxiter=maxiter,
         titer_thresh=titer_thresh)
-    cat, modelim, skyim, psf = res
+
+    cat, model_list, sky_list, psfs = (res["stars"], res["model"], res["sky"], res["psfs"])
+    modelim = model_list[0]
+    skyim   = sky_list[0]
+    psf     = psfs[0]
+    
+    #Format fixing 
+    b0 = [n for n in cat.dtype.names if n.endswith('_b0')]
+    cat = rfn.append_fields(cat, [n[:-3] for n in b0 if n[:-3] not in cat.dtype.names],
+                            [cat[n] for n in b0 if n[:-3] not in cat.dtype.names],
+                            usemask=False) if b0 else cat
+    cat = rfn.drop_fields(cat, b0) if b0 else cat
+
     if len(cat) > 0:
         ra, dec = wcs0.all_pix2world(cat['y'], cat['x'], 0.)
     else:
-        ra = numpy.zeros(0, dtype='f8')
-        dec = numpy.zeros(0, dtype='f8')
+        ra = np.zeros(0, dtype='f8')
+        dec = np.zeros(0, dtype='f8')
     from numpy.lib.recfunctions import rec_append_fields
-    decapsid = numpy.zeros(len(cat), dtype='i8')
+    decapsid = np.zeros(len(cat), dtype='i8')
     decapsid[:] = (expnum*2**32*2**7 +
                    hdr['CCDNUM']*2**32 +
-                   numpy.arange(len(cat), dtype='i8'))
+                   np.arange(len(cat), dtype='i8'))
     hdr['EXTNAME'] = hdr['EXTNAME']+'_HDR'
-    if numpy.any(wt > 0):
-        hdr['GAINCRWD'] = numpy.nanmedian((im*wt**2.)[wt > 0])
-        hdr['SKYCRWD'] = numpy.nanmedian(skyim[wt > 0])
+    if np.any(wt > 0):
+        hdr['GAINCRWD'] = np.nanmedian((im*wt**2.)[wt > 0])
+        hdr['SKYCRWD'] = np.nanmedian(skyim[wt > 0])
     else:
         hdr['GAINCRWD'] = 4
         hdr['SKYCRWD'] = 0
     if len(cat) > 0:
-        hdr['FWHMCRWD'] = numpy.nanmedian(cat['fwhm'])
+        hdr['FWHMCRWD'] = np.nanmedian(cat['fwhm'])
     else:
         hdr['FWHMCRWD'] = 0.0
-    gain = hdr['GAINCRWD']*numpy.ones(len(cat), dtype='f4')
+    gain = hdr['GAINCRWD']*np.ones(len(cat), dtype='f4')
     if prb is not None:
         prnebdat = [
             crowdsource_base.extract_im(cat['x'], cat['y'], prb[:, :, i])
@@ -255,7 +267,7 @@ def process_image(base, date, filtf, vers, outfn=None, overwrite=False,
                   outmodel=False, outdirc=None, outdirm=None, verbose=False,
                   resume=False, bmask_deblend=False,
                   maskgal=False, maskdiffuse=True, contmask=False,
-                  nproc=numpy.inf,
+                  nproc=np.inf,
                   extnamelist=None, plot=False, profile=False, miniter=4,
                   maxiter=10, titer_thresh=2, pixsz=9, wcutoff=0.0,
                   nthreads=1,
@@ -286,15 +298,15 @@ def process_image(base, date, filtf, vers, outfn=None, overwrite=False,
     coordcen = SkyCoord(
         ra=prihdr['RA'], dec=prihdr['DEC'],
         unit=(units.hourangle, units.deg))
-    sep = angular_separation(numpy.radians(brightstars['ra']),
-                             numpy.radians(brightstars['dec']),
+    sep = angular_separation(np.radians(brightstars['ra']),
+                             np.radians(brightstars['dec']),
                              coordcen.ra.to(units.radian).value,
                              coordcen.dec.to(units.radian).value)
-    sep = numpy.degrees(sep)
+    sep = np.degrees(sep)
     m = sep < 3
     brightstars = brightstars[m]
     dmjd = prihdr['MJD-OBS'] - 51544.5  # J2000 MJD.
-    cosd = numpy.cos(numpy.radians(numpy.clip(brightstars['dec'],
+    cosd = np.cos(np.radians(np.clip(brightstars['dec'],
                                               -89.9999, 89.9999)))
     brightstars['ra'] += dmjd*brightstars['pmra']/365.25/cosd/1000/60/60
     brightstars['dec'] += dmjd*brightstars['pmde']/365.25/1000/60/60
@@ -354,7 +366,7 @@ def process_image(base, date, filtf, vers, outfn=None, overwrite=False,
         hdr = fits.getheader(imfn, extname=name)
         if 'FWHM' in hdr:
             fwhms.append(hdr['FWHM'])
-    fwhms = numpy.array(fwhms)
+    fwhms = np.array(fwhms)
     fwhms = fwhms[fwhms > 0]
 
     # Prepare main CCD for loop
@@ -449,7 +461,7 @@ def save_fxn(res, bigdict):
         sys.stdout.flush()
     # primary extension includes only header.
     if not modsaveonly:
-        fits.append(outfn, numpy.zeros(0), hdr)
+        fits.append(outfn, np.zeros(0), hdr)
     hdupsf = fits.BinTableHDU(psf.serialize())
     hdupsf.name = hdr['EXTNAME'][:-4] + '_PSF'
     hducat = fits.BinTableHDU(cat)
@@ -496,22 +508,22 @@ def decam_psf(filt, fwhm, pixsz=9):
                          'psf_%s_deconv_mod.fits.gz' % filt[0])
     normalizesz = 59
     tpsf = fits.getdata(fname).T.copy()
-    tpsf /= numpy.sum(psfmod.central_stamp(tpsf, normalizesz))
+    tpsf /= np.sum(psfmod.central_stamp(tpsf, normalizesz))
     # omitting central_stamp here places too much
     # emphasis on the wings relative to the pipeline estimate.
     tpsffwhm = psfmod.neff_fwhm(psfmod.central_stamp(tpsf))
     from scipy.ndimage import convolve
     if tpsffwhm < fwhm:
-        convpsffwhm = numpy.sqrt(fwhm**2.-tpsffwhm**2.)
+        convpsffwhm = np.sqrt(fwhm**2.-tpsffwhm**2.)
         convpsf = psfmod.moffat_psf(convpsffwhm, stampsz=39, deriv=False)
         tpsf = convolve(tpsf, convpsf, mode='constant', cval=0., origin=0)
     else:
         convpsffwhm = 0.
-    tpsf = psfmod.stamp2model(numpy.array([tpsf, tpsf, tpsf, tpsf]),
+    tpsf = psfmod.stamp2model(np.array([tpsf, tpsf, tpsf, tpsf]),
                               normalize=normalizesz)
     pixsz = pixsz
     nlinperpar = 3
-    extraparam = numpy.zeros(
+    extraparam = np.zeros(
         1, dtype=[('convparam', 'f4', 3*nlinperpar+1),
                   ('resparam', 'f4', (nlinperpar, pixsz, pixsz))])
     extraparam['convparam'][0, 0:4] = [convpsffwhm, 1., 0., 1.]
@@ -523,24 +535,24 @@ def decam_psf(filt, fwhm, pixsz=9):
 
 
 def correct_sky_offset(im, weight=None):
-    xx = numpy.arange(im.shape[0], dtype='f4')
-    xx -= numpy.median(xx)
+    xx = np.arange(im.shape[0], dtype='f4')
+    xx -= np.median(xx)
     xx = xx.reshape(-1, 1)
     if weight is None:
-        weight = numpy.ones_like(im)*10
+        weight = np.ones_like(im)*10
     half = (im.shape[1] // 2)
     bdy = 10
     use = ((weight[:, half+bdy:half:-1] > 0) &
            (weight[:, half-bdy:half] > 0))
-    if numpy.sum(use) == 0:
+    if np.sum(use) == 0:
         return im
     delta = im[:, half+bdy:half:-1] - im[:, half-bdy:half]
-    weight = numpy.min([weight[:, half+bdy:half:-1],
+    weight = np.min([weight[:, half+bdy:half:-1],
                         weight[:, half-bdy:half]], axis=0)
 
     def objective(par):
         return psfmod.damper(((delta - par[0] - par[1]*xx)*weight)[use], 5)
-    guessoff = numpy.median(delta[use])
+    guessoff = np.median(delta[use])
     from scipy.optimize import leastsq
     par = leastsq(objective, [guessoff, 0.])[0]
     im[:, half:] -= (par[0] + par[1]*xx)
@@ -554,10 +566,10 @@ def mask_very_bright_stars(dq, blist):
         maskrad = maskradpermag*(11-mag)
         if maskrad < 50:
             continue
-        maskrad = numpy.clip(maskrad, 0, 500)
-        xl, xr = numpy.clip([x-maskrad, x+maskrad], 0,
+        maskrad = np.clip(maskrad, 0, 500)
+        xl, xr = np.clip([x-maskrad, x+maskrad], 0,
                             dq.shape[0]-1).astype('i4')
-        yl, yr = numpy.clip([y-maskrad, y+maskrad], 0,
+        yl, yr = np.clip([y-maskrad, y+maskrad], 0,
                             dq.shape[1]-1).astype('i4')
         dq[xl:xr, yl:yr] |= extrabits['brightstar']
         dq[xl:xr, yl:yr] |= (crowdsource_base.nodeblend_maskbit |
@@ -606,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument('--nthreads', type=int,
                         default=1, help='num of parallel processes (not threads)')
     parser.add_argument('--nccds', type=int,
-                        default=numpy.inf, help='run only first nccds ccds')
+                        default=np.inf, help='run only first nccds ccds')
     parser.add_argument('--ccdlist', nargs='+', default=None,
                         help='limit run to subset of ccds listed')
     # Diagnostic options

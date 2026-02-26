@@ -184,6 +184,10 @@ def peakfind(ims, models, isigs, dq, psfs, *,
     -------
     x, y : 1-D int arrays
         Coordinates of detected peaks.
+    sigim : 2D ndarray
+        Detection significance image (e.g., S/N-like).
+    modelsigim : 2D ndarray
+        Model significance image. Useful for QA/debugging.
     """
     from scipy.ndimage import filters
 
@@ -214,9 +218,10 @@ def peakfind(ims, models, isigs, dq, psfs, *,
     isig_tot = den / np.sqrt(den_var)
     
     # Weighted PSFstamp st each band’s PSF contributes proportional to that band's contribution to the combined image
-    wavg = [np.median(w * isig**2) for w, isig in zip(band_weights, isigs)]
-    wavg /= np.sum(wavg)
+    wavg = np.array([np.median(w * isig**2) for w, isig in zip(band_weights, isigs)], dtype=float)
+    wavg /= wavg.sum()
     psf_tot = np.sum([wi * p for wi, p in zip(wavg, psfstamps)], axis=0)
+
 
     # Find local maxima above threshold
     sig_max = filters.maximum_filter(sigim, maxfiltershape)
@@ -366,7 +371,7 @@ def build_sparse_matrix(images_pad, weights_pad, psfs, x, y,
     psfs : list of list of ndarray
         psfs[b][j][i] gives PSF stamp for source i, derivative j (0=flux, 1=dx, 2=dy) in band b.
     x, y : ndarray
-        Shared source positions (length N).
+        Shared PADDED source positions (length N).
     psfderiv : bool
         If True, include dx, dy PSF derivatives as shared parameters.
     nskyx, nskyy : int
@@ -394,17 +399,15 @@ def build_sparse_matrix(images_pad, weights_pad, psfs, x, y,
     # PSF stamp sizes
     sz_b = [np.array([psfs[b][0][i].shape[-1] for i in range(N)]) for b in range(B)]
     szo2_b = [sz // 2 for sz in sz_b]
-    stampsz = max(max(sz) for sz in sz_b) if N > 0 else 19      # for safety, I pick a common stampsz across both bands
+    stampsz = max(max(sz) for sz in sz_b) if N > 0 else 19      # common stampsz across both bands to keep images aligned
 
-
-    # Coordinates on padded images
-    pad = stampsz // 2 + 1
+    # Coordinates on padded images (x,y are already in padded coords)
     xp = np.round(x).astype('i4')
     yp = np.round(y).astype('i4')
-    # _subtract_ stampszo2 to move from the center of the PSF to the edge of the stamp.
-    # _add_ pad back to move from the original image to the padded image.
-    xe = xp - stampsz // 2 + pad
-    ye = yp - stampsz // 2 + pad
+    
+    # move from PSF center to stamp edge (top-left corner of stamp box)
+    xe = xp - stampsz // 2
+    ye = yp - stampsz // 2
 
     # Pixel grid for stamps to track where each pixel lands on the image
     # convention: x is the first index, y is the second
@@ -596,7 +599,7 @@ def fit_once(ims, x, y, psfs, weights=None, psfderiv=False, nskyx=0, nskyy=0, gu
     """
 
     # Detect single-band or multiband case
-    if np.array(ims).ndim == 2:
+    if np.array(ims).ndim == 2: 
         ims = [ims]
         psfs = [psfs]
         weights = [weights]
@@ -614,9 +617,13 @@ def fit_once(ims, x, y, psfs, weights=None, psfderiv=False, nskyx=0, nskyy=0, gu
         im_pad, wt_pad = pad_image_and_weight(ims[b], weights[b], pad)
         images_pad.append(im_pad)
         weights_pad.append(wt_pad)
+        
+    # Images are now padded but x, y were estimated on unpadded image. So we pad them here.
+    xp = np.round(x).astype('i4') + pad
+    yp = np.round(y).astype('i4') + pad
 
     # Build sparse matrix
-    mat, colnorm, npixim, nskypar = build_sparse_matrix( images_pad, weights_pad, psfs, x, y, psfderiv=psfderiv, nskyx=nskyx, nskyy=nskyy, guess=guess)
+    mat, colnorm, npixim, nskypar = build_sparse_matrix( images_pad, weights_pad, psfs, xp, yp, psfderiv=psfderiv, nskyx=nskyx, nskyy=nskyy, guess=guess)
 
     # RHS= (stacked image*weight) 
     rhs = np.concatenate([(images_pad[b]*weights_pad[b]).ravel() for b in range(B)])
@@ -775,7 +782,7 @@ def build_source_stamps(x, y, psflists, flux, images, resids, weights, centroids
                 psf_stamp = psfmod.central_stamp(psflists[b][j][i], censize=centroidsize)
                 if np.all(psf_stamp == 0):
                     # Fallback: rebuild from canonical PSF at (x[i], y[i])
-                    psf_stamp = psfmod.central_stamp(psflist[b][j][i], censize=centroidsize, force_center=True)
+                    psf_stamp = psfmod.central_stamp(psflists[b][j][i], censize=centroidsize, force_center=True)
                     if psf_stamp is None or np.all(psf_stamp == 0):
                         print(f"[repair-final] source {i}, comp {j}: could not restore PSF stamp")
                 psfs[j][i, :, :] = psf_stamp
@@ -786,7 +793,9 @@ def build_source_stamps(x, y, psflists, flux, images, resids, weights, centroids
         # source centers & padding for stamp extraction
         xp = np.round(x).astype('i4')
         yp = np.round(y).astype('i4')
-        xe = xp - stampszo2 + stampszo2
+        # subtracting to get to the edge of the stamp, adding back to deal with the padded image. 
+        # The point we want the edge from the middle (subtract stampszo2) but the image is padded by szo2 (add stampszo2).
+        xe = xp - stampszo2 + stampszo2   
         ye = yp - stampszo2 + stampszo2
 
         resid = np.pad(resids[b], [stampszo2, stampszo2], constant_values=0., mode='constant')
@@ -810,17 +819,17 @@ def build_source_stamps(x, y, psflists, flux, images, resids, weights, centroids
             modelst += psfs[1] * flux_b[1:len(x) * len(psflists[b]):len(psflists[b])].reshape(-1, 1, 1)
             modelst += psfs[2] * flux_b[2:len(x) * len(psflists[b]):len(psflists[b])].reshape(-1, 1, 1)
 
-        # centroid outputs are zeros; stamps unchanged - This is to keep output structure identical to previous version
         if np.any([np.all(w == 0) for w in weightst]):
             print(f"[band {b}] Warning: empty weight stamp for some sources")
-
-        # stamps: 0: neighbor-subtracted images,
-        #         1: images,
-        #         2: psfs with shifts,
-        #         3: weights,
-        #         4: psfs without shifts
+            
+        # stamps tuple:
+        #   0: neighbor-subtracted stamp (model + residual)
+        #   1: image stamp
+        #   2: model stamp (base PSF plus shifts, i.e., dx/dy PSF-deriv terms. flux scaling applied)
+        #   3: weight stamp
+        #   4: base PSF stamp (flux component only; no dx/dy terms)
         res = (modelst + residst, imst, modelst, weightst, psfst)
-        stamps_b.append(res)  # keep only stamps tuple
+        stamps_b.append(res)  
 
     # Stack per element across bands = (B, N, S, S)
     stacked = tuple(np.stack([st[idx] for st in stamps_b], axis=0) for idx in range(len(stamps_b[0])))
@@ -1099,8 +1108,16 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
             minsz_b.append(np.min(sz) if len(sz) else 19)
 
         N = len(xa)
+        N_old = len(xa) - len(xn)
+        N_new = len(xn)
+        
         if guessflux is not None:
-            guess = np.concatenate([guessflux, np.zeros_like(xn).repeat(B)])
+            guessflux_b = guessflux.reshape(B, N_old)          # split old guesses per band
+            zeros_new   = np.zeros(N_new, dtype=guessflux.dtype)
+            guess = np.concatenate([
+                np.concatenate([guessflux_b[b], zeros_new])    # pad each band with zeros for new sources
+                for b in range(B)
+            ])
         else:
             guess = None
         skys = hskys if titer >= 2 else lskys
@@ -1129,17 +1146,15 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
 
             # Sources in this subregion (shared positions across all bands)
             mbda_src = in_bounds(xa, ya, [bdxaf-0.5, bdxal-0.5], [bdyaf-0.5, bdyal-0.5])
-            if not np.any(mbda_src): continue
+            if not np.any(mbda_src): 
+                continue
             mbd = in_bounds(xa, ya, [bdxf-0.5, bdxl-0.5], [bdyf-0.5, bdyl-0.5])
-
-            # Expand to band-space indices for flux/guess (flat [B*N])
-            mbda = np.concatenate([b*len(xa) + mbda_src for b in range(B)])
         
             # Extract cutouts per band
-            sall = np.s_[bdxaf:bdxal, bdyaf:bdyal]
-            spri = np.s_[bdxf:bdxl, bdyf:bdyl]
+            sall = np.s_[bdxaf:bdxal, bdyaf:bdyal]   # ALL region slice (big)
+            spri = np.s_[bdxf:bdxl, bdyf:bdyl]       # PRIMARY region slice (small)
             dx, dy = bdxal-bdxaf, bdyal-bdyaf
-            sfit = np.s_[bdxf-bdxaf:dx+bdxl-bdxal, bdyf-bdyaf:dy+bdyl-bdyal]
+            sfit = np.s_[bdxf-bdxaf:dx+bdxl-bdxal, bdyf-bdyaf:dy+bdyl-bdyal]   #cutout coordinates of the PRIMARY
 
             # Build PSFs, prepare inputs for fitting
             psfsbda = [build_psf_list(xa[mbda_src], ya[mbda_src], psfs[b], sz_b[b][mbda_src], psfderiv=tpsfderiv) for b in range(B)]
@@ -1161,32 +1176,41 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
                 imgs_tile, xa[mbda_src]-bdxaf, ya[mbda_src]-bdyaf, psfsbda,
                 psfderiv=tpsfderiv, weights=weights_tile, guess=guessmbda,
                 nskyx=nskyx, nskyy=nskyy)
+            
             # print("fit_once:", time.time()-t_fo)
 
-            ind  = np.flatnonzero(mbda_src)   # global indices into 0..N-1
-            ind2 = np.arange(len(ind))            # local indices 0..M-1
-            M    = len(ind)     # Its same as len(ind2)
+            ind_all = np.flatnonzero(mbda_src)   # sources included in the fit (ALL region = PRIMARY + BOUNDARY)
+            ind_pri = np.flatnonzero(mbd)        # sources owned by this tile (PRIMARY region)
             
-            # Accumulate outputs
+            # Map primary sources into local ALL coordinates
+            ind_pri_loc = np.searchsorted(ind_all, ind_pri)   
+
+            M_all = len(ind_all)
+            ind2 = np.arange(M_all)  # local indices for PSF stamp building (still ALL sources)   
+                        
+            # Store new fluxes
             for b in range(B):
                 models[b][spri] = tmodels[b][sfit]
                 mskys[b][spri] = tmskys[b][sfit]
-                
-                # Store fluxes into the global flat array
-                loc_start = b*M
-                loc_stop  = (b+1)*M    
+                            
+                loc_start = b*M_all
+                loc_stop  = (b+1)*M_all
                 glob_start = b*N
-                flux[glob_start + ind] = tflux[0][loc_start:loc_stop]  
+            
+                # only commit PRIMARY sources
+                flux[glob_start + ind_pri] = tflux[0][loc_start:loc_stop][ind_pri_loc]
 
-            # # Scatter *shared derivatives* (dx,dy) (if present): global deriv block starts at B*N 
-            if tpsfderiv and M > 0:
+            # # Store (dx,dy) (if present): global deriv block starts at B*N 
+            if tpsfderiv and M_all > 0:
                 deriv_off_glob = B*N
-                deriv_off_loc  = B*M     # after the B*M flux block locally
-                # dx (even index), dy (odd index) interleaved per source locally
-                dx_loc = tflux[0][deriv_off_loc : deriv_off_loc + 2*M : 2]
-                dy_loc = tflux[0][deriv_off_loc+1 : deriv_off_loc + 2*M : 2]
-                flux[deriv_off_glob + 2*ind] = dx_loc
-                flux[deriv_off_glob + 2*ind+1] = dy_loc
+                deriv_off_loc  = B*M_all
+            
+                dx_all = tflux[0][deriv_off_loc : deriv_off_loc + 2*M_all : 2]
+                dy_all = tflux[0][deriv_off_loc+1 : deriv_off_loc + 2*M_all : 2]
+            
+                # only commit PRIMARY sources
+                flux[deriv_off_glob + 2*ind_pri]     = dx_all[ind_pri_loc]
+                flux[deriv_off_glob + 2*ind_pri + 1] = dy_all[ind_pri_loc]
 
             # Update per-tile sky
             if nskypar > 0:
@@ -1194,7 +1218,7 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
 
             # Build PSF stamps for this tile (optional but gives big speed-up in centroiding)
             for b in range(B):
-                if M > 0:
+                if M_all > 0:
                     for k in range(n_psfcomps):
                         psf_block = np.stack(
                             [psfmod.central_stamp(psfsbda[b][k][tind], minsz_b[b]) for tind in ind2],
@@ -1231,7 +1255,7 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
 
         # Centroiding step (shared across bands)
         N = len(xa)
-        if N > 0 and len(flux) >= B*N + 2*N:
+        if N > 0 and psfderiv:
             xcen = flux[B*N:B*N+2*N:2].astype('f4')
             ycen = flux[B*N+1:B*N+2*N:2].astype('f4')
 
@@ -1354,12 +1378,34 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
         [('passno', passno)] +
         [(f, stats[f]) for f in stats]
     )
+
+    # compress single-band output to drop multiband-only fields (*_joint) and rename *_b0
+    if B == 1:
+        compressed = OrderedDict()
+        for k, v in stars.items():
+            if k.endswith('_joint'):
+                continue          # drop joint fields in single-band case
+            if k.endswith('_b0'):
+                compressed[k[:-3]] = v   # rename flux_b0 -> flux, etc.
+            else:
+                compressed[k] = v
+        stars = compressed
+    # ---------------------------------------
+    
     dtype = np.dtype({'names': list(stars.keys()),
                       'formats': [stars[n].dtype for n in stars.keys()]})
     stars = np.fromiter(zip(*stars.values()), dtype=dtype, count=len(stars['x']))
 
     # print(f"[fit_im] total time: {time.time() - t0_all:.3f} s")
-    return stars, [models[b] + skys[b] for b in range(B)], [skys[b] + mskys[b] for b in range(B)], psfs, iter_history
+    result = {
+    "stars": stars,
+    "model": [models[b] + skys[b] for b in range(B)],
+    "sky":   [skys[b] + mskys[b] for b in range(B)],
+    "psfs": psfs,
+    "iter_history": iter_history,
+    }
+    return result
+    
 
 
 def compute_stats(xs, ys, stamps, flux_flat):
@@ -1477,8 +1523,8 @@ def compute_stats(xs, ys, stamps, flux_flat):
         fluxlbs, dfluxlbs = compute_lbs_flux(impsf_b, psf_b, w_b, flux_b / (norm + (norm == 0)))
         fluxlbs, dfluxlbs = fluxlbs.astype('f4'), dfluxlbs.astype('f4')
 
-        # "isolated" flux; fit flux & centroid as if the star were a single star, based
-        # on imaged where neighbors have been subtracted from best simultaneous fit.
+        # "isolated" flux; fit flux & centroid as if the star were a single star, 
+        # based on imaged where neighbors have been subtracted from best simultaneous fit.
         fluxiso, xiso, yiso = compute_iso_fit(impsf_b, psf_b, w_b, flux_b / (norm + (norm == 0)), psfderiv)
 
         # Effective PSF FWHM for this source

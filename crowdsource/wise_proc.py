@@ -498,7 +498,11 @@ if __name__ == "__main__":
         psfvalsharpcutfac=0.5, psfsharpsat=0.8
     )
 
-    cat, model, sky, psf, snapshots = res
+    cat = res["stars"]
+    model = res["model"]
+    sky = res["sky"]
+    psf = res["psfs"]
+    snapshots = res["iter_history"]
 
     if args.save_snapshot:
         snapfn = os.path.join(outdir, "snapshot", f"{coadd_id}.{bands_str}{bw_str}.snapshots.npz")
