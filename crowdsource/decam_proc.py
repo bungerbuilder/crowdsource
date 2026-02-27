@@ -214,13 +214,6 @@ def process_one_ccd(name, bigdict):
     modelim = model_list[0]
     skyim   = sky_list[0]
     psf     = psfs[0]
-    
-    #Format fixing 
-    b0 = [n for n in cat.dtype.names if n.endswith('_b0')]
-    cat = rfn.append_fields(cat, [n[:-3] for n in b0 if n[:-3] not in cat.dtype.names],
-                            [cat[n] for n in b0 if n[:-3] not in cat.dtype.names],
-                            usemask=False) if b0 else cat
-    cat = rfn.drop_fields(cat, b0) if b0 else cat
 
     if len(cat) > 0:
         ra, dec = wcs0.all_pix2world(cat['y'], cat['x'], 0.)

@@ -1259,26 +1259,34 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
             xcen = flux[B*N:B*N+2*N:2].astype('f4')
             ycen = flux[B*N+1:B*N+2*N:2].astype('f4')
 
-            if titer == 0:
-                flux_b = flux[:B*N].reshape(B, N)
-            
-                fluxunc_b = np.sum(stamps[2]**2 * stamps[3]**2, axis=(2, 3))
-                fluxunc_b = (fluxunc_b + (fluxunc_b == 0)*1e-20)**(-0.5)
-                snr_b = flux_b / fluxunc_b
-                best_band = np.argmax(snr_b, axis=0)   # shape (N,)
-            
-                flux_snr = flux_b[best_band, np.arange(N)]
-                flux_snr = flux_snr + (flux_snr == 0)*1e-20
-            
-                xcen /= flux_snr
-                ycen /= flux_snr
+            # ----- Convert the shared LSQR "derivative" parameters into actual pixel shifts. -----
+            # In the design matrix, the dPSF/dx and dPSF/dy columns are scaled by a flux guess:
+            #   - for old sources, guessflux ~ true flux, so the solved coefficients are already dx,dy pixel shifts
+            #   - for newly detected sources, guessflux = 1, so the solved coefficients are flux*dx, flux*dy
+            # Therefore, for new sources only, we divide by an estimated flux (best-SNR band) to recover dx,dy.
 
-                # # Only apply centroid update if SNR is decent?
-                # snr_joint = np.sqrt(np.sum(np.clip(snr_b, 0, np.inf)**2, axis=0))
-                # good = snr_joint > 5.0   # 3 gives same result
-                
-                # xcen[~good] = 0.0
-                # ycen[~good] = 0.0
+            flux_b = flux[:B*N].reshape(B, N)
+        
+            fluxunc_b = np.sum(stamps[2]**2 * stamps[3]**2, axis=(2, 3))
+            fluxunc_b = (fluxunc_b + (fluxunc_b == 0)*1e-20)**(-0.5)
+            snr_b = flux_b / fluxunc_b
+            best_band = np.argmax(snr_b, axis=0)   # shape (N,)
+        
+            flux_snr = flux_b[best_band, np.arange(N)]
+            flux_snr = flux_snr + (flux_snr == 0)*1e-20
+
+            new = (passno == titer)
+
+            # Only new sources need normalization by flux
+            xcen[new] /= flux_snr[new]
+            ycen[new] /= flux_snr[new]
+
+            # # Only apply centroid update if SNR is decent?
+            # snr_joint = np.sqrt(np.sum(np.clip(snr_b, 0, np.inf)**2, axis=0))
+            # good = snr_joint > 5.0   # 3 gives same result
+            
+            # xcen[~good] = 0.0
+            # ycen[~good] = 0.0
 
 
             print(f"[iter {titer}] var(xcen)={mad_std(xcen):.3e}, var(ycen)={mad_std(ycen):.3e}, "f"rms(dx)={np.sqrt(np.mean(xcen**2 + ycen**2)):.3e}")
