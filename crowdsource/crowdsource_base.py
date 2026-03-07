@@ -1145,8 +1145,8 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
                 subreg_iter += 1
 
             # Sources in this subregion (shared positions across all bands)
-            mbda_src = in_bounds(xa, ya, [bdxaf-0.5, bdxal-0.5], [bdyaf-0.5, bdyal-0.5])
-            if not np.any(mbda_src): 
+            mbda = in_bounds(xa, ya, [bdxaf-0.5, bdxal-0.5], [bdyaf-0.5, bdyal-0.5])
+            if not np.any(mbda): 
                 continue
             mbd = in_bounds(xa, ya, [bdxf-0.5, bdxl-0.5], [bdyf-0.5, bdyl-0.5])
         
@@ -1157,7 +1157,7 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
             sfit = np.s_[bdxf-bdxaf:dx+bdxl-bdxal, bdyf-bdyaf:dy+bdyl-bdyal]   #cutout coordinates of the PRIMARY
 
             # Build PSFs, prepare inputs for fitting
-            psfsbda = [build_psf_list(xa[mbda_src], ya[mbda_src], psfs[b], sz_b[b][mbda_src], psfderiv=tpsfderiv) for b in range(B)]
+            psfsbda = [build_psf_list(xa[mbda], ya[mbda], psfs[b], sz_b[b][mbda], psfderiv=tpsfderiv) for b in range(B)]
             imgs_tile    = [images[b][sall]  - skys[b][sall] for b in range(B)]
             weights_tile = [weights[b][sall] for b in range(B)]
             
@@ -1166,66 +1166,45 @@ def fit_im(images, psfs, weights=None, dq=None, band_weights=None,
 
             # Prepare guesses if given
             if guess is not None:
-                ind = np.flatnonzero(mbda_src)   # fitted sources (reuse same 'ind')
+                ind = np.flatnonzero(mbda)   # fitted sources (reuse same 'ind')
                 guess_local_flux = guess[:B*N].reshape(B, N)[:, ind].ravel(order='C')
-                guessmbda = np.concatenate([guess_local_flux, skypar.get((bdxf, bdyf), np.zeros(B*nskypar, 'f4'))]) if nskypar>0 else guess_local_flux
+                guessmbda = np.concatenate([guess_local_flux, skypar[(bdxf, bdyf)]])
             else: guessmbda = None
 
             # t_fo = time.time()
             tflux, tmodels, tmskys = fit_once(
-                imgs_tile, xa[mbda_src]-bdxaf, ya[mbda_src]-bdyaf, psfsbda,
+                imgs_tile, xa[mbda]-bdxaf, ya[mbda]-bdyaf, psfsbda,
                 psfderiv=tpsfderiv, weights=weights_tile, guess=guessmbda,
                 nskyx=nskyx, nskyy=nskyy)
+
+            if np.all(np.isnan(tmodels)):
+                raise ValueError("Model is all NaNs")
             
             # print("fit_once:", time.time()-t_fo)
 
-            ind_all = np.flatnonzero(mbda_src)   # sources included in the fit (ALL region = PRIMARY + BOUNDARY)
-            ind_pri = np.flatnonzero(mbd)        # sources owned by this tile (PRIMARY region)
+            # Fit is done on ALL-region sources (primary + boundary) to avoid edge effects,
+            # but we only commit parameters only for PRIMARY sources so each source is written once.
+            # ind_all = np.flatnonzero(mbda)   # sources included in the fit (ALL region = PRIMARY + BOUNDARY)
+            ind_pri_full = np.flatnonzero(mbd)        # sources owned by this tile (PRIMARY region)
+            ind_pri_local = np.flatnonzero(mbd[mbda])  # Map primary sources into local ALL coordinates
             
-            # Map primary sources into local ALL coordinates
-            ind_pri_loc = np.searchsorted(ind_all, ind_pri)   
+            N_local = np.sum(mbda)  # number of sources fit in this tile (ALL region)
+            if N_local>0:
+                if tpsfderiv:  
+                    # Store (dx,dy) (if present): block starts at B*N globally and B*N_local locally; interleaved per source
+                    for d in range(2):
+                        flux[B*N + 2*ind_pri_full + d] = tflux[0][B*N_local + 2*ind_pri_local + d]
 
-            M_all = len(ind_all)
-            ind2 = np.arange(M_all)  # local indices for PSF stamp building (still ALL sources)   
-                        
-            # Store new fluxes
-            for b in range(B):
-                models[b][spri] = tmodels[b][sfit]
-                mskys[b][spri] = tmskys[b][sfit]
-                            
-                loc_start = b*M_all
-                loc_stop  = (b+1)*M_all
-                glob_start = b*N
-            
-                # only commit PRIMARY sources
-                flux[glob_start + ind_pri] = tflux[0][loc_start:loc_stop][ind_pri_loc]
-
-            # # Store (dx,dy) (if present): global deriv block starts at B*N 
-            if tpsfderiv and M_all > 0:
-                deriv_off_glob = B*N
-                deriv_off_loc  = B*M_all
-            
-                dx_all = tflux[0][deriv_off_loc : deriv_off_loc + 2*M_all : 2]
-                dy_all = tflux[0][deriv_off_loc+1 : deriv_off_loc + 2*M_all : 2]
-            
-                # only commit PRIMARY sources
-                flux[deriv_off_glob + 2*ind_pri]     = dx_all[ind_pri_loc]
-                flux[deriv_off_glob + 2*ind_pri + 1] = dy_all[ind_pri_loc]
+                for b in range(B):
+                    models[b][spri] = tmodels[b][sfit]
+                    mskys[b][spri] = tmskys[b][sfit]
+                    flux[b*N + ind_pri_full] = tflux[0][b*N_local + ind_pri_local]
+                    for k in range(n_psfcomps):
+                        psf_stamps[b][k][ind_pri_full] = np.stack([psfmod.central_stamp(psfsbda[b][k][tind], minsz_b[b]) for tind in ind_pri_local], axis=0).astype('f4')
 
             # Update per-tile sky
             if nskypar > 0:
                 skypar[(bdxf, bdyf)] = tflux[0][-B*nskypar:].copy()
-
-            # Build PSF stamps for this tile (optional but gives big speed-up in centroiding)
-            for b in range(B):
-                if M_all > 0:
-                    for k in range(n_psfcomps):
-                        psf_block = np.stack(
-                            [psfmod.central_stamp(psfsbda[b][k][tind], minsz_b[b]) for tind in ind2],
-                            axis=0
-                        ).astype('f4')  # (M, S, S)
-                        # Insert into the global psf_stamps
-                        psf_stamps[b][k][mbda_src] = psf_block
 
             # try to free memory!  Not sure where the circular reference
             # could be, but this makes a factor of a few difference
