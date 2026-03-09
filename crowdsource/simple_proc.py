@@ -13,7 +13,7 @@ def process(im, sqivar, flag, psf, nx=1, ny=1, satlimit=numpy.inf, **kw):
         m = im > satlimit
         m = morphology.binary_dilation(m, numpy.ones((5, 5)))
         sqivar[m] = 0  # should also change the DQ image?
-    res = crowdsource_base.fit_im(im, psf, weight=sqivar, dq=flag,
+    res = crowdsource_base.fit_im(im, psf, weights=sqivar, dq=flag, maxstars=10000000, fewstars = 60,
                              ntilex=nx, ntiley=ny, **kw)
     return res
 
@@ -41,14 +41,17 @@ if __name__ == "__main__":
         from functools import partial
         psf.fitfun = partial(psfmod.wise_psf_fit, psfstamp=stamp)
     else:
-        print('using moffat')
-        psf = psfmod.SimplePSF(psfmod.moffat_psf(2.5, beta=2.5)[0])
+        # print('using moffat PSF')
+        # psf = psfmod.SimplePSF(psfmod.moffat_psf(2.5, beta=2.5)[0])
+        print(f'using gaussian PSF')
+        psf = psfmod.SimplePSF(psfmod.gaussian_psf(2)[0])
+        
     im = fits.getdata(imagefn)
     sqivar = numpy.sqrt(fits.getdata(ivarfn))
     flag = fits.getdata(flagfn)
     res = process(im, sqivar, flag, psf, refit_psf=args.refit_psf,
                   verbose=args.verbose, nx=4, ny=4, satlimit=args.satlimit)
     outfn = args.outfn[0]
-    fits.writeto(outfn, res[0])
-    fits.append(outfn, res[1])
-    fits.append(outfn, res[2])
+    fits.writeto(outfn, res[0], overwrite=True)
+    fits.append(outfn, res[1][0])
+    fits.append(outfn, res[2][0])
