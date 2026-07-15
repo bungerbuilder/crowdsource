@@ -61,6 +61,6 @@ def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw)
     res = crowdsource_base.fit_im(im, psf, sqivar, dq=flag, refit_psf=True,
                                   verbose = True, ntilex=nx, ntiley=ny, **kw)
 
-    print("CROWDSOURCE is done!")
+    print("crowdsource is done!")
     
     return res, visit_image
