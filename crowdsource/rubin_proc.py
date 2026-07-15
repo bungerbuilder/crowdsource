@@ -56,7 +56,7 @@ def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw)
     flag = (mask.array & bad_bits).astype(np.uint32)
     sqivar[(mask.array & bad_bits) != 0] = 0.0
 
-    """Run CROWDSOURCE on an image"""
+    """Run crowdsource on an image"""
     
     res = crowdsource_base.fit_im(im, psf, sqivar, dq=flag, refit_psf=True,
                                   verbose = True, ntilex=nx, ntiley=ny, **kw)
