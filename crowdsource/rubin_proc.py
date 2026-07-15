@@ -39,7 +39,7 @@ def process(visitId, detector, nx = 4, ny = 4, maxstars = 10000000, fewstars = 6
     psf = psfmod.SimplePSF(stamp)
     psf.fitfun = partial(psfmod.wise_psf_fit, psfstamp=stamp)
 
-    """Making the variables for CROWDSOURCE"""
+    """Making the variables for crowdsource"""
     
     im = visit_image.image.array.astype(np.float32)
     
