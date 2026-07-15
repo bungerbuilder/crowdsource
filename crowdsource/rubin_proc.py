@@ -6,7 +6,7 @@ from lsst.daf.butler import Butler
 from functools import partial
 
 
-def process(visitId, detector, nx = 4, ny = 4, maxstars = 10000000, fewstars = 60, **kw):
+def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw):
     """Use the RSP Butler to find the Rubin image"""
     
     butler = Butler("dp1", collections="LSSTComCam/DP1")
