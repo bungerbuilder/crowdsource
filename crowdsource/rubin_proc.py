@@ -1,14 +1,32 @@
+
 import numpy as np
 import argparse, os, pdb
 import crowdsource.psf as psfmod
 from crowdsource import crowdsource_base
 from lsst.daf.butler import Butler
 from functools import partial
-
-
-def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw):
-    """Use the RSP Butler to find the Rubin image"""
+ 
+ 
+def process(visitId, detector, nx = 4, ny = 4, maxstars = 10000000, fewstars = 60, threshold = 5, **kw):
+    """
+    Parameters
+    ----------
+    visitId : Rubin images are taken with an associated visitId attatched in the metadata. There are nine
+              images associated with one visitId.
+    detector: Determines which of the nine images will be processed. 
     
+    Process: 
+    1. Use the RSP Butler to find the Rubin image
+    2. Get the PSF using wise_psf_fit
+    3. Making the variables for CROWDSOURCE
+    4. Run CROWDSOURCE on an image
+
+    Returns
+    -------
+    res : The processed image as an array. 
+
+    """
+ 
     butler = Butler("dp1", collections="LSSTComCam/DP1")
     
     dataset_refs = list(butler.query_datasets(
@@ -16,19 +34,18 @@ def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw)
         where="visit.id = :visitId AND detector.id = :detector",
         bind={"visitId": visitId, "detector": detector},
     ))
-
+ 
     if len(dataset_refs) == 0:
         raise RuntimeError(
             f"No visit_image found for visit={visitId}, detector={detector}")
-
+ 
     else:
         print(f"Visit image found for visit={visitId}, detector={detector}")
             
     ref = list(dataset_refs)[0]
     visit_image = butler.get(ref)
 
-    """Get the PSF using wise_psf_fit"""
-    
+    #Getting the PSF    
     rubin_psf = visit_image.getPsf()
     visit_center = visit_image.getBBox().getCenter()
     psf_stamp_visit = rubin_psf.computeImage(visit_center).array
@@ -39,8 +56,7 @@ def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw)
     psf = psfmod.SimplePSF(stamp)
     psf.fitfun = partial(psfmod.wise_psf_fit, psfstamp=stamp)
 
-    """Making the variables for crowdsource"""
-    
+    #crowdsource variables
     im = visit_image.image.array.astype(np.float32)
     
     var = visit_image.variance.array
@@ -56,11 +72,71 @@ def process(visitId, detector, nx=4, ny=4, maxstars=10000000, fewstars=60, **kw)
     flag = (mask.array & bad_bits).astype(np.uint32)
     sqivar[(mask.array & bad_bits) != 0] = 0.0
 
-    """Run crowdsource on an image"""
-    
+    #run crowdsource
     res = crowdsource_base.fit_im(im, psf, sqivar, dq=flag, refit_psf=True,
-                                  verbose = True, ntilex=nx, ntiley=ny, **kw)
-
-    print("crowdsource is done!")
+                                  verbose = True, ntilex=nx, ntiley=ny, maxiter = 10, threshold = threshold, **kw)
+ 
+    print("CROWDSOURCE is done!")
     
-    return res, visit_image
+    return res
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run CROWDSOURCE on a Rubin visit_image retrieved via the Butler."
+    )
+    parser.add_argument("visitId", type=int,
+                         help="Visit ID of the Rubin image to process.")
+    parser.add_argument("detector", type=int,
+                         help="Detector ID (selects which of the nine images to process).")
+    parser.add_argument("--nx", type=int, default=4,
+                         help="Number of tiles in x for CROWDSOURCE (default: 4).")
+    parser.add_argument("--ny", type=int, default=4,
+                         help="Number of tiles in y for CROWDSOURCE (default: 4).")
+    parser.add_argument("--maxstars", type=int, default=10000000,
+                         help="Maximum number of stars to fit (default: 10000000).")
+    parser.add_argument("--fewstars", type=int, default=60,
+                         help="Threshold below which a tile is considered to have few stars (default: 60).")
+    parser.add_argument("--threshold", type=float, default=5,
+                         help="Detection threshold in sigma (default: 5).")
+    parser.add_argument("--maxiter", type=int, default=10,
+                         help="Maximum number of CROWDSOURCE iterations (default: 10).")
+    parser.add_argument("-o", "--outfile", type=str, default=None,
+                         help="Path to save the output (pickle). If not given, "
+                              "defaults to 'rubin_visit{visitId}_det{detector}.pkl'.")
+    parser.add_argument("--pdb", action="store_true",
+                         help="Drop into a pdb debugger on exception.")
+    return parser.parse_args()
+ 
+ 
+def main():
+    args = parse_args()
+ 
+    try:
+        res = process(
+            args.visitId,
+            args.detector,
+            nx=args.nx,
+            ny=args.ny,
+            maxstars=args.maxstars,
+            fewstars=args.fewstars,
+            threshold=args.threshold,
+            maxiter=args.maxiter,
+        )
+    except Exception:
+        if args.pdb:
+            pdb.post_mortem()
+        raise
+ 
+    outfile = args.outfile or f"rubin_visit{args.visitId}_det{args.detector}.pkl"
+ 
+    import pickle
+    with open(outfile, "wb") as f:
+        pickle.dump(res, f)
+ 
+    print(f"Results saved to {outfile}")
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
