@@ -81,62 +81,34 @@ def process(visitId, detector, nx = 4, ny = 4, maxstars = 10000000, fewstars = 6
     return res
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run CROWDSOURCE on a Rubin visit_image retrieved via the Butler."
-    )
-    parser.add_argument("visitId", type=int,
-                         help="Visit ID of the Rubin image to process.")
-    parser.add_argument("detector", type=int,
-                         help="Detector ID (selects which of the nine images to process).")
-    parser.add_argument("--nx", type=int, default=4,
-                         help="Number of tiles in x for CROWDSOURCE (default: 4).")
-    parser.add_argument("--ny", type=int, default=4,
-                         help="Number of tiles in y for CROWDSOURCE (default: 4).")
-    parser.add_argument("--maxstars", type=int, default=10000000,
-                         help="Maximum number of stars to fit (default: 10000000).")
-    parser.add_argument("--fewstars", type=int, default=60,
-                         help="Threshold below which a tile is considered to have few stars (default: 60).")
-    parser.add_argument("--threshold", type=float, default=5,
-                         help="Detection threshold in sigma (default: 5).")
-    parser.add_argument("--maxiter", type=int, default=10,
-                         help="Maximum number of CROWDSOURCE iterations (default: 10).")
-    parser.add_argument("-o", "--outfile", type=str, default=None,
-                         help="Path to save the output (pickle). If not given, "
-                              "defaults to 'rubin_visit{visitId}_det{detector}.pkl'.")
-    parser.add_argument("--pdb", action="store_true",
-                         help="Drop into a pdb debugger on exception.")
-    return parser.parse_args()
- 
- 
-def main():
-    args = parse_args()
- 
-    try:
-        res = process(
-            args.visitId,
-            args.detector,
-            nx=args.nx,
-            ny=args.ny,
-            maxstars=args.maxstars,
-            fewstars=args.fewstars,
-            threshold=args.threshold,
-            maxiter=args.maxiter,
-        )
-    except Exception:
-        if args.pdb:
-            pdb.post_mortem()
-        raise
- 
-    outfile = args.outfile or f"rubin_visit{args.visitId}_det{args.detector}.pkl"
- 
-    import pickle
-    with open(outfile, "wb") as f:
-        pickle.dump(res, f)
- 
-    print(f"Results saved to {outfile}")
- 
- 
 if __name__ == "__main__":
-    main()
+    from astropy.io import fits
  
+    parser = argparse.ArgumentParser(description='Run crowdsource on a Rubin visit_image')
+    # 3 arguments: visitId, detector, outfn
+    parser.add_argument('visitId', type=int, nargs=1)
+    parser.add_argument('detector', type=int, nargs=1)
+    parser.add_argument('outfn', type=str, nargs=1)
+    parser.add_argument('--nx', '-x', type=int, default=4,
+                        help='number of tiles in x')
+    parser.add_argument('--ny', '-y', type=int, default=4,
+                        help='number of tiles in y')
+    parser.add_argument('--maxstars', type=int, default=10000000,
+                        help='maximum number of stars to fit')
+    parser.add_argument('--fewstars', type=int, default=60,
+                        help='number of stars below which a tile is considered to have few stars')
+    parser.add_argument('--threshold', '-t', type=float, default=5,
+                        help='detection threshold in sigma')
+    args = parser.parse_args()
+ 
+    visitId = args.visitId[0]
+    detector = args.detector[0]
+    outfn = args.outfn[0]
+ 
+    res = process(visitId, detector, nx=args.nx, ny=args.ny,
+                  maxstars=args.maxstars, fewstars=args.fewstars,
+                  threshold=args.threshold)
+ 
+    fits.writeto(outfn, res[0], overwrite=True)
+    fits.append(outfn, res[1][0])
+    fits.append(outfn, res[2][0])
